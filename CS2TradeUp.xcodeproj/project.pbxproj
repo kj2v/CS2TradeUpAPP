@@ -6,8 +6,29 @@
 	objectVersion = 77;
 	objects = {
 
+/* Begin PBXBuildFile section */
+		5227BECA2EEFF3ED00318EF7 /* cs2_skins_db.json in Resources */ = {isa = PBXBuildFile; fileRef = 5227BEC92EEFF3ED00318EF7 /* cs2_skins_db.json */; };
+		52D738482EEAD3CE00044FF8 /* SkinModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 52D738472EEAD3C900044FF8 /* SkinModel.swift */; };
+		52D738532EEAD8BB00044FF8 /* DataManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = 52D738522EEAD8BB00044FF8 /* DataManager.swift */; };
+		52D738552EEAD95000044FF8 /* ContentView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 52D738542EEAD95000044FF8 /* ContentView.swift */; };
+		52D738572EEADAB000044FF8 /* CS2TradeUpApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 52D738562EEADA9C00044FF8 /* CS2TradeUpApp.swift */; };
+		52D738592EEADDFF00044FF8 /* skins.json in Resources */ = {isa = PBXBuildFile; fileRef = 52D738582EEADDFF00044FF8 /* skins.json */; };
+		52D7385B2EEADF3E00044FF8 /* CachedImage.swift in Sources */ = {isa = PBXBuildFile; fileRef = 52D7385A2EEADF3800044FF8 /* CachedImage.swift */; };
+		52D7385F2EEC0F6B00044FF8 /* PriceModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 52D7385E2EEC0F6500044FF8 /* PriceModel.swift */; };
+		52E7BCF72EF027810014A68C /* RecipeFeature.swift in Sources */ = {isa = PBXBuildFile; fileRef = 52E7BCF62EF0277C0014A68C /* RecipeFeature.swift */; };
+/* End PBXBuildFile section */
+
 /* Begin PBXFileReference section */
+		5227BEC92EEFF3ED00318EF7 /* cs2_skins_db.json */ = {isa = PBXFileReference; lastKnownFileType = text.json; path = cs2_skins_db.json; sourceTree = "<group>"; };
 		52D737962EEAC4AF00044FF8 /* CS2TradeUp.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = CS2TradeUp.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		52D738472EEAD3C900044FF8 /* SkinModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SkinModel.swift; sourceTree = "<group>"; };
+		52D738522EEAD8BB00044FF8 /* DataManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DataManager.swift; sourceTree = "<group>"; };
+		52D738542EEAD95000044FF8 /* ContentView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ContentView.swift; sourceTree = "<group>"; };
+		52D738562EEADA9C00044FF8 /* CS2TradeUpApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CS2TradeUpApp.swift; sourceTree = "<group>"; };
+		52D738582EEADDFF00044FF8 /* skins.json */ = {isa = PBXFileReference; lastKnownFileType = text.json; path = skins.json; sourceTree = "<group>"; };
+		52D7385A2EEADF3800044FF8 /* CachedImage.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CachedImage.swift; sourceTree = "<group>"; };
+		52D7385E2EEC0F6500044FF8 /* PriceModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PriceModel.swift; sourceTree = "<group>"; };
+		52E7BCF62EF0277C0014A68C /* RecipeFeature.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RecipeFeature.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedRootGroup section */
@@ -34,6 +55,15 @@
 			children = (
 				52D737982EEAC4AF00044FF8 /* CS2TradeUp */,
 				52D737972EEAC4AF00044FF8 /* Products */,
+				52D738472EEAD3C900044FF8 /* SkinModel.swift */,
+				52D738522EEAD8BB00044FF8 /* DataManager.swift */,
+				52D7385E2EEC0F6500044FF8 /* PriceModel.swift */,
+				52D738542EEAD95000044FF8 /* ContentView.swift */,
+				52D738562EEADA9C00044FF8 /* CS2TradeUpApp.swift */,
+				52D738582EEADDFF00044FF8 /* skins.json */,
+				52D7385A2EEADF3800044FF8 /* CachedImage.swift */,
+				52E7BCF62EF0277C0014A68C /* RecipeFeature.swift */,
+				5227BEC92EEFF3ED00318EF7 /* cs2_skins_db.json */,
 			);
 			sourceTree = "<group>";
 		};
@@ -82,6 +112,7 @@
 				TargetAttributes = {
 					52D737952EEAC4AF00044FF8 = {
 						CreatedOnToolsVersion = 26.1.1;
+						LastSwiftMigration = 2610;
 					};
 				};
 			};
@@ -109,6 +140,8 @@
 			isa = PBXResourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				52D738592EEADDFF00044FF8 /* skins.json in Resources */,
+				5227BECA2EEFF3ED00318EF7 /* cs2_skins_db.json in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -119,6 +152,13 @@
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				52D738482EEAD3CE00044FF8 /* SkinModel.swift in Sources */,
+				52E7BCF72EF027810014A68C /* RecipeFeature.swift in Sources */,
+				52D738532EEAD8BB00044FF8 /* DataManager.swift in Sources */,
+				52D738572EEADAB000044FF8 /* CS2TradeUpApp.swift in Sources */,
+				52D738552EEAD95000044FF8 /* ContentView.swift in Sources */,
+				52D7385F2EEC0F6B00044FF8 /* PriceModel.swift in Sources */,
+				52D7385B2EEADF3E00044FF8 /* CachedImage.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -246,6 +286,7 @@
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
+				CLANG_ENABLE_MODULES = YES;
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
 				DEVELOPMENT_TEAM = 67LNFD757Q;
@@ -278,6 +319,7 @@
 				SWIFT_APPROACHABLE_CONCURRENCY = YES;
 				SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor;
 				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
 				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
 				SWIFT_VERSION = 5.0;
 				TARGETED_DEVICE_FAMILY = "1,2,7";
@@ -290,6 +332,7 @@
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
+				CLANG_ENABLE_MODULES = YES;
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
 				DEVELOPMENT_TEAM = 67LNFD757Q;
