@@ -36,8 +36,14 @@ extension Skin {
     func getSearchName(isStatTrak: Bool, wear: Double) -> String {
         let wearName = Wear.allCases.first { $0.range.contains(wear) }?.rawValue ?? "崭新出厂"
         let base = self.baseName
+        
         if isStatTrak {
-            return "\(base)（StatTrak™） (\(wearName))"
+            if base.contains(" | ") {
+                let statTrakBase = base.replacingOccurrences(of: " | ", with: "（StatTrak™） | ")
+                return "\(statTrakBase) (\(wearName))"
+            } else {
+                return "\(base)（StatTrak™） (\(wearName))"
+            }
         } else {
             return "\(base) (\(wearName))"
         }
@@ -46,8 +52,6 @@ extension Skin {
 
 // MARK: - 2. 数据模型
 
-// 确保 TradeItem 遵循 Codable 以便保存
-// 注意：TradeItem 在这里定义，RecipeFeature.swift 可以直接使用它
 struct TradeItem: Identifiable, Equatable, Codable {
     let id: UUID
     let skin: Skin
@@ -85,7 +89,7 @@ struct SimulationResult: Identifiable {
 }
 
 struct CollectionGroup: Identifiable {
-    var id: String { name } // 使用名称作为稳定 ID
+    var id: String { name }
     
     let name: String
     let items: [TradeItem]
@@ -112,9 +116,6 @@ struct SelectableSkinWrapper: Identifiable {
         return price > 0 ? String(format: "¥%.2f", price) : "---"
     }
 }
-
-// ⚠️ 已移除 SavedRecipe 和 RecipeManager 的定义
-// 因为它们已经存在于你的 RecipeFeature.swift 文件中
 
 // MARK: - 3. ViewModel
 
@@ -507,6 +508,48 @@ struct CustomTradeUpView: View {
     var body: some View {
         NavigationStack {
             VStack(spacing: 0) {
+                // MARK: - 自定义顶部栏 (Custom Header)
+                // 彻底替代系统导航栏，解决折叠问题
+                HStack(alignment: .center) {
+                    Text("自定义炼金")
+                        .font(.largeTitle) // 大字号
+                        .fontWeight(.bold)
+                    
+                    Spacer()
+                    
+                    // 右侧按钮组
+                    if viewModel.filledCount > 0 {
+                        HStack(spacing: 0) {
+                            Button(action: {
+                                saveTitle = ""
+                                showSaveAlert = true
+                            }) {
+                                Text("保存")
+                                    .foregroundColor(.green)
+                                    .fontWeight(.medium)
+                            }
+                            
+                            Rectangle()
+                                .fill(Color.gray.opacity(0.3))
+                                .frame(width: 1, height: 14)
+                                .padding(.horizontal, 12)
+                            
+                            Button(action: {
+                                withAnimation { viewModel.isEditing.toggle() }
+                            }) {
+                                Text(viewModel.isEditing ? "完成" : "编辑")
+                                    .fontWeight(viewModel.isEditing ? .bold : .regular)
+                                    .foregroundColor(.blue)
+                            }
+                        }
+                        .font(.system(size: 17)) // 统一按钮字号
+                    }
+                }
+                .padding(.horizontal, 16)
+                .padding(.top, 10) // 顶部留白
+                .padding(.bottom, 5)
+                .background(Color(UIColor.systemBackground)) // 确保背景不透明
+                
                 // 顶部数据栏
                 ScrollView(.horizontal, showsIndicators: false) {
                     HStack(spacing: 12) {
@@ -637,27 +680,8 @@ struct CustomTradeUpView: View {
                     }
                 }
             }
-            .navigationTitle("自定义炼金")
-            .toolbar {
-                ToolbarItem(placement: .topBarTrailing) {
-                    HStack(spacing: 16) {
-                        Button(action: {
-                            saveTitle = ""
-                            showSaveAlert = true
-                        }) {
-                            Image(systemName: "square.and.arrow.down")
-                        }
-                        .disabled(viewModel.filledCount == 0)
-                        
-                        if viewModel.filledCount > 0 {
-                            Button(viewModel.isEditing ? "完成" : "编辑") {
-                                withAnimation { viewModel.isEditing.toggle() }
-                            }
-                            .fontWeight(viewModel.isEditing ? .bold : .regular)
-                        }
-                    }
-                }
-            }
+            // 🟢 核心修复：完全隐藏系统导航栏，改用上方的手写 HStack
+            .toolbar(.hidden, for: .navigationBar)
             .alert("保存配方", isPresented: $showSaveAlert) {
                 TextField("请输入配方名称", text: $saveTitle)
                 Button("取消", role: .cancel) { }
