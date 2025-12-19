@@ -66,7 +66,8 @@ struct TradeItem: Identifiable, Equatable, Codable {
     }
     
     static func == (lhs: TradeItem, rhs: TradeItem) -> Bool {
-        return lhs.id == rhs.id && lhs.wearValue == rhs.wearValue && lhs.isStatTrak == rhs.isStatTrak
+        // 严格比较：ID、磨损值、暗金状态都必须一致
+        return lhs.id == rhs.id && abs(lhs.wearValue - rhs.wearValue) < 0.0000001 && lhs.isStatTrak == rhs.isStatTrak
     }
     
     var displayName: String {
@@ -131,6 +132,38 @@ class TradeUpViewModel {
     
     var expectedValue: Double = 0.0
     var roi: Double = 0.0
+    
+    // MARK: - 状态快照机制 (Snapshot)
+    // 用于对比是否发生了更改
+    private var originalSnapshot: [TradeItem] = []
+    
+    // MARK: - 配方编辑状态追踪
+    // 监听 ID 变化，自动记录快照
+    var currentEditingRecipeId: UUID? = nil {
+        didSet {
+            if currentEditingRecipeId != nil {
+                // 进入编辑模式时，记录当前状态为“原始状态”
+                snapshotState()
+            } else {
+                // 退出编辑模式，清空快照
+                originalSnapshot = []
+            }
+        }
+    }
+    var currentEditingRecipeTitle: String = ""
+    
+    // 检查是否有未保存的更改
+    var hasUnsavedChanges: Bool {
+        guard currentEditingRecipeId != nil else { return false }
+        let currentItems = slots.compactMap { $0 }
+        // 比较当前项和快照是否一致
+        return currentItems != originalSnapshot
+    }
+    
+    // 手动更新快照（通常在保存成功后调用）
+    func snapshotState() {
+        originalSnapshot = slots.compactMap { $0 }
+    }
     
     var filledCount: Int { slots.compactMap { $0 }.count }
     var countString: String { "\(filledCount)/10" }
@@ -220,6 +253,22 @@ class TradeUpViewModel {
         simulationResults = []
         expectedValue = 0.0
         roi = 0.0
+    }
+    
+    // 退出编辑模式
+    func exitEditMode() {
+        currentEditingRecipeId = nil
+        currentEditingRecipeTitle = ""
+        // 注意：不清除 slots，允许用户基于旧配方修改后存为新配方
+    }
+    
+    // 新增：完全重置（用于清空按钮等）
+    func clearAll() {
+        slots = Array(repeating: nil, count: 10)
+        resetResult()
+        currentEditingRecipeId = nil
+        currentEditingRecipeTitle = ""
+        isEditing = false
     }
     
     func simulate() {
@@ -441,17 +490,21 @@ struct ContentView: View {
     @State private var viewModel = TradeUpViewModel()
     @State private var activeSheetItem: activeSheet?
     @State private var pendingEditorIndex: Int?
+    @State private var selectedTab = 0 // 添加 Tab 选中状态管理
     
     var body: some View {
-        TabView {
+        TabView(selection: $selectedTab) { // 绑定选中状态
             CustomTradeUpView(viewModel: viewModel, activeSheetItem: $activeSheetItem, pendingEditorIndex: $pendingEditorIndex)
-                .tabItem { Label("自定义炼金", systemImage: "hammer.fill") }
+                .tabItem { Label("新建配方", systemImage: "hammer.fill") } // 修改标题
+                .tag(0) // Tag 0
             
             Text("分类二：待开发")
                 .tabItem { Label("库存模拟", systemImage: "cube.box.fill") }
+                .tag(1) // Tag 1
                 
-            MyRecipesView()
+            MyRecipesView(viewModel: viewModel, selectedTab: $selectedTab) // 传入共享状态
                 .tabItem { Label("我的配方", systemImage: "list.bullet.clipboard") }
+                .tag(2) // Tag 2
         }
         .sheet(item: $activeSheetItem, onDismiss: {
             if let index = pendingEditorIndex {
@@ -503,6 +556,7 @@ struct CustomTradeUpView: View {
     @Binding var pendingEditorIndex: Int?
     
     @State private var showSaveAlert = false
+    @State private var showExitAlert = false // 新增：退出确认弹窗
     @State private var saveTitle = ""
     
     var body: some View {
@@ -510,10 +564,66 @@ struct CustomTradeUpView: View {
             VStack(spacing: 0) {
                 // MARK: - 自定义顶部栏 (Custom Header)
                 // 彻底替代系统导航栏，解决折叠问题
-                HStack(alignment: .center) {
-                    Text("自定义炼金")
-                        .font(.largeTitle) // 大字号
-                        .fontWeight(.bold)
+                HStack(alignment: .top) { // 改为顶对齐，适应多行
+                    VStack(alignment: .leading, spacing: 4) {
+                        // 动态大标题：有配方名显示配方名，没有则显示“新建配方”
+                        let displayTitle = (viewModel.currentEditingRecipeId != nil && !viewModel.currentEditingRecipeTitle.isEmpty)
+                            ? viewModel.currentEditingRecipeTitle
+                            : "新建配方"
+                            
+                        Text(displayTitle)
+                            .font(.largeTitle) // 大字号
+                            .fontWeight(.bold)
+                            .lineLimit(1) // 防止标题过长换行
+                            .minimumScaleFactor(0.8) // 允许适当缩小
+                        
+                        // 动态状态栏：显示“新建模式”或“退出编辑”按钮
+                        if viewModel.currentEditingRecipeId != nil {
+                            // 编辑模式：显示红色退出按钮
+                            Button(action: {
+                                if viewModel.hasUnsavedChanges {
+                                    showExitAlert = true
+                                } else {
+                                    withAnimation(.spring(response: 0.3, dampingFraction: 0.6)) {
+                                        viewModel.exitEditMode()
+                                    }
+                                }
+                            }) {
+                                HStack(spacing: 4) {
+                                    Image(systemName: "arrow.uturn.backward.circle.fill")
+                                    Text("退出配方修改")
+                                }
+                                .font(.caption)
+                                .fontWeight(.bold)
+                                .foregroundColor(.white)
+                                .padding(.horizontal, 10)
+                                .padding(.vertical, 5)
+                                .background(
+                                    Capsule()
+                                        .fill(Color.red.opacity(0.9))
+                                        .shadow(color: .red.opacity(0.3), radius: 4, x: 0, y: 2)
+                                )
+                            }
+                            .transition(.asymmetric(insertion: .scale.combined(with: .opacity), removal: .scale.combined(with: .opacity)))
+                        } else {
+                            // 新建模式：显示安静的提示
+                            HStack(spacing: 4) {
+                                Image(systemName: "sparkles")
+                                Text("当前为新建模式")
+                            }
+                            .font(.caption)
+                            .fontWeight(.medium)
+                            .foregroundColor(.secondary)
+                            .padding(.horizontal, 8)
+                            .padding(.vertical, 4)
+                            .background(
+                                Capsule()
+                                    .fill(Color(UIColor.secondarySystemBackground))
+                            )
+                            .transition(.opacity)
+                        }
+                    }
+                    .animation(.default, value: viewModel.currentEditingRecipeId) // 为整个标题区域添加动画
                     
                     Spacer()
                     
@@ -521,7 +631,8 @@ struct CustomTradeUpView: View {
                     if viewModel.filledCount > 0 {
                         HStack(spacing: 0) {
                             Button(action: {
-                                saveTitle = ""
+                                // 如果正在编辑旧配方，使用它的标题作为默认值
+                                saveTitle = viewModel.currentEditingRecipeTitle
                                 showSaveAlert = true
                             }) {
                                 Text("保存")
@@ -543,6 +654,7 @@ struct CustomTradeUpView: View {
                             }
                         }
                         .font(.system(size: 17)) // 统一按钮字号
+                        .padding(.top, 8) // 微调对齐
                     }
                 }
                 .padding(.horizontal, 16)
@@ -682,6 +794,7 @@ struct CustomTradeUpView: View {
             }
             // 🟢 核心修复：完全隐藏系统导航栏，改用上方的手写 HStack
             .toolbar(.hidden, for: .navigationBar)
+            // 保存弹窗
             .alert("保存配方", isPresented: $showSaveAlert) {
                 TextField("请输入配方名称", text: $saveTitle)
                 Button("取消", role: .cancel) { }
@@ -689,7 +802,22 @@ struct CustomTradeUpView: View {
                     saveRecipe()
                 }
             } message: {
-                Text("配方将保存到“我的配方”模块中")
+                if viewModel.currentEditingRecipeId != nil {
+                    Text("当前正在编辑现有配方：\n“\(viewModel.currentEditingRecipeTitle)”\n保存将覆盖原记录。")
+                } else {
+                    Text("新配方将保存到“我的配方”模块中")
+                }
+            }
+            // 退出确认弹窗
+            .alert("未保存的更改", isPresented: $showExitAlert) {
+                Button("取消", role: .cancel) { }
+                Button("直接退出", role: .destructive) {
+                    withAnimation(.spring(response: 0.3, dampingFraction: 0.6)) {
+                        viewModel.exitEditMode()
+                    }
+                }
+            } message: {
+                Text("您对“\(viewModel.currentEditingRecipeTitle)”进行了更改但尚未保存。\n直接退出将丢失这些更改。")
             }
         }
     }
@@ -702,6 +830,7 @@ struct CustomTradeUpView: View {
         }
     }
     
+    // MARK: - 保存逻辑核心修改
     func saveRecipe() {
         let items = viewModel.slots.compactMap { $0 }
         if items.isEmpty { return }
@@ -717,7 +846,11 @@ struct CustomTradeUpView: View {
             bestOutcomeData = (best.skin, prob, wearName)
         }
         
+        // 关键逻辑：如果有当前 ID，则使用该 ID 更新；否则生成新 ID
+        let recipeId = viewModel.currentEditingRecipeId ?? UUID()
+        
         let newRecipe = SavedRecipe(
+            id: recipeId, // 使用现有 ID 或新 ID
             title: saveTitle.isEmpty ? "未命名配方" : saveTitle,
             items: items,
             ev: viewModel.expectedValue,
@@ -726,6 +859,13 @@ struct CustomTradeUpView: View {
         )
         
         RecipeManager.shared.saveRecipe(newRecipe)
+        
+        // 保存后更新当前编辑状态，防止重复新建
+        viewModel.currentEditingRecipeId = newRecipe.id
+        viewModel.currentEditingRecipeTitle = newRecipe.title
+        
+        // 关键：保存成功后，更新快照状态，意味着“更改已保存”
+        viewModel.snapshotState()
     }
 }
 
