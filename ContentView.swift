@@ -498,8 +498,9 @@ struct ContentView: View {
                 .tabItem { Label("新建配方", systemImage: "hammer.fill") } // 修改标题
                 .tag(0) // Tag 0
             
-            Text("分类二：待开发")
-                .tabItem { Label("库存模拟", systemImage: "cube.box.fill") }
+            // 修改这里：接入 InventorySmartView
+            InventorySmartView()
+                .tabItem { Label("库存配平", systemImage: "wand.and.stars") }
                 .tag(1) // Tag 1
                 
             MyRecipesView(viewModel: viewModel, selectedTab: $selectedTab) // 传入共享状态
@@ -591,7 +592,7 @@ struct CustomTradeUpView: View {
                             }) {
                                 HStack(spacing: 4) {
                                     Image(systemName: "arrow.uturn.backward.circle.fill")
-                                    Text("退出配方修改")
+                                    Text("退出编辑模式")
                                 }
                                 .font(.caption)
                                 .fontWeight(.bold)
