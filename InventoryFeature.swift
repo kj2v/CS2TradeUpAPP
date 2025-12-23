@@ -18,15 +18,17 @@ class PriceCurveService {
     
     private func fetchBestMatchPrice(skin: Skin, wear: Double, isStatTrak: Bool) -> Double {
         let wearName = Wear.allCases.first { $0.range.contains(wear) }?.rawValue ?? "崭新出厂"
-        let prefix = isStatTrak ? "StatTrak™ " : ""
-        let base = skin.baseName
+        let prefix = isStatTrak ? "（StatTrak™）" : ""
+        let base = skin.baseName // 例如 "Galil AR | Cold Fusion" 或 "Galil AR | 冰核聚变"
         
-        // 1. 标准名称
+        // 1. 标准名称精确匹配
+        // 尝试: "StatTrak™ Galil AR | 冰核聚变 (崭新出厂)"
         let searchName = "\(prefix)\(base) (\(wearName))"
         let p1 = DataManager.shared.getSmartPrice(for: searchName)
         if p1 > 0 { return p1 }
         
         // 2. 去空格尝试
+        // 尝试: "StatTrak™GalilAR|冰核聚变 (崭新出厂)"
         let noSpaceBase = base.replacingOccurrences(of: " ", with: "")
         if noSpaceBase != base {
             let variantName = "\(prefix)\(noSpaceBase) (\(wearName))"
@@ -34,7 +36,88 @@ class PriceCurveService {
             if p > 0 { return p }
         }
         
+        // 3. 智能模糊匹配 (针对翻译混乱的枪名)
+        // 策略：分割 武器 | 皮肤，保持皮肤名不变，尝试替换武器名为常见的中文翻译
+        if let fuzzyPrice = fetchFuzzyPrice(base: base, wearName: wearName, prefix: prefix) {
+            return fuzzyPrice
+        }
+        
         return 0
+    }
+    
+    private func fetchFuzzyPrice(base: String, wearName: String, prefix: String) -> Double? {
+        // 必须包含竖杠，因为策略是 "竖杠后肯定匹配"
+        let parts = base.components(separatedBy: " | ")
+        guard parts.count == 2 else { return nil }
+        
+        let weaponRaw = parts[0] // e.g. "Galil AR" 或 "加利尔 AR"
+        let skinName = parts[1]  // e.g. "冰核聚变" (用户确认此部分准确)
+        
+        // 定义模糊匹配规则：(中文关键词, [尝试的数据库可能存在的武器名])
+        // 只要 weaponRaw 包含 关键词，就尝试组合所有 替换词
+        // 这里的关键词使用中文，以适应全中文的输入源
+        let fuzzyRules: [(String, [String])] = [
+            ("加利尔", ["加利尔 AR", "加利尔", "Galil AR"]),
+            ("USP", ["USP 消音版", "USP-S", "USP"]),
+            ("格洛克", ["格洛克 18 型", "格洛克 18", "格洛克", "Glock-18"]),
+            ("CZ75", ["CZ75 自动手枪", "CZ75-Auto", "CZ75"]),
+            ("沙漠之鹰", ["沙漠之鹰", "Desert Eagle"]),
+            ("FN57", ["FN57", "Five-SeveN"]),
+            ("双持贝瑞塔", ["双持贝瑞塔", "Dual Berettas"]),
+            ("M4A1", ["M4A1 消音型", "M4A1-S", "M4A1"]), // 包含 M4A1 关键词
+            ("MAC-10", ["MAC-10", "MAC-10 冲锋枪"]),
+            ("MP9", ["MP9", "MP9 冲锋枪"]),
+            ("R8", ["R8 左轮手枪", "R8 Revolver"]),
+            ("SSG", ["SSG 08", "鸟狙"]), // 覆盖 SSG 08
+            ("鸟狙", ["SSG 08", "鸟狙"]),
+            ("SCAR", ["SCAR-20", "SCAR-20 自动狙击步枪"]),
+            ("G3SG1", ["G3SG1", "G3SG1 自动狙击步枪"]),
+            ("法玛斯", ["法玛斯", "FAMAS"]),
+            ("野牛", ["PP-野牛", "PP-Bizon"]),
+            ("MP7", ["MP7", "MP7 冲锋枪"]),
+            ("P90", ["P90", "P90 冲锋枪"]),
+            ("UMP-45", ["UMP-45", "UMP-45 冲锋枪"]),
+            ("MAG-7", ["MAG-7", "警喷"]),
+            ("XM1014", ["XM1014", "自动霰弹枪"]),
+            ("新星", ["新星", "Nova"]),
+            ("截短", ["截短霰弹枪", "Sawed-Off"]),
+            ("M249", ["M249"])
+        ]
+        
+        for (keyword, replacements) in fuzzyRules {
+            // 如果当前的枪名包含关键词 (例如 "加利尔 AR" 包含 "加利尔")
+            // 兼容输入可能是英文的情况 (keyword 用 localizedCaseInsensitiveContains 或手动添加英文 Key)
+            if weaponRaw.contains(keyword) || weaponRaw.localizedCaseInsensitiveContains(keyword) {
+                for rep in replacements {
+                    // 构造新的尝试名称：前缀(StatTrak™) + 替换后的武器名 + | + 准确的皮肤名 + (磨损)
+                    // 这样 StatTrak™ 会被正确保留在最前面，仅替换中间的枪名
+                    let tryName = "\(rep)\(prefix) | \(skinName) (\(wearName))"
+                    // M249（StatTrak™） | 闹市区 (略有磨损)
+                    // print(tryName)
+                    let p = DataManager.shared.getSmartPrice(for: tryName)
+                    if p > 0 {
+                        // print("✅ [Fuzzy Match Success] \(base) -> \(tryName)") // Debug
+                        return p
+                    }
+                }
+            }
+        }
+        
+        // 如果以上规则都没命中，但包含英文，尝试最简单的中文直译推测（针对部分通用格式）
+        // 比如有些数据仅仅是把 AR 去掉
+        if weaponRaw.contains(" AR") {
+            let simpleRep = weaponRaw.replacingOccurrences(of: " AR", with: "")
+            let tryName = "\(prefix)\(simpleRep) | \(skinName) (\(wearName))"
+            if let p = check(tryName) { return p }
+        }
+        
+        return nil
+    }
+    
+    // 辅助检查函数
+    private func check(_ name: String) -> Double? {
+        let p = DataManager.shared.getSmartPrice(for: name)
+        return p > 0 ? p : nil
     }
 }
 
@@ -439,15 +522,16 @@ struct SteamSkinSelectorView: View {
     }
     
     private func processGroups() {
-        print("🕒 [Debug] 界面出现，开始执行匹配逻辑... \(Date())")
+        print("🕒 [Debug] 界面出现，开始执行匹配逻辑... \(Date()) attempt: \(retryAttempt)")
         
-        let allSkins = DataManager.shared.getAllSkins()
+        // 🚨 关键修复：加入重试逻辑
+        // 因为 DataManager 可能是首次被访问，正在后台异步加载 JSON/API，
+        // 导致 getAllSkins() 返回空，或者 getSmartPrice 返回 0。
         
-        // 🚨 关键修复：等待皮肤库 AND 价格库都准备好
-        // 如果皮肤库是空的，肯定匹配不到；如果价格库是空的，显示“暂无报价”
-        
-        // 异步计算
         DispatchQueue.global(qos: .userInitiated).async {
+            // 每次执行时都重新获取一次 Skin 列表，以防 DataManager 刚加载完
+            let allSkins = DataManager.shared.getAllSkins()
+            
             // 1. 按 Steam 原名分组
             let grouped = Dictionary(grouping: inventory) { $0.name }
             
@@ -495,10 +579,34 @@ struct SteamSkinSelectorView: View {
                 )
             }.sorted { $0.count > $1.count }
             
+            // 3. 检查数据质量 (是否加载了价格或皮肤)
+            // 如果库存不为空，但计算结果里 0 个匹配 或 0 个有价格，说明数据库可能还没好
+            let hasMatches = computedGroups.contains { $0.matchedSkin != nil }
+            let hasPrices = computedGroups.contains { $0.avgPrice > 0 }
+            let isInventoryEmpty = self.inventory.isEmpty
+            
             DispatchQueue.main.async {
-                self.groups = computedGroups
-                self.isLoading = false
-                print("✅ [Debug] 匹配完成! 结果: \(computedGroups.count) 组")
+                // 如果库存非空，但完全没有匹配到价格或皮肤，且重试次数 < 3，则认为是数据未加载
+                if !isInventoryEmpty && (!hasMatches || !hasPrices) && self.retryAttempt < 3 {
+                    self.retryAttempt += 1
+                    let delay = 0.5 * Double(self.retryAttempt) // 递增等待：0.5s, 1.0s, 1.5s
+                    
+                    print("⚠️ [Debug] 数据库似乎未就绪 (匹配: \(hasMatches), 价格: \(hasPrices))，\(delay)秒后重试...")
+                    self.debugInfo = "等待数据加载 (尝试 \(self.retryAttempt)/3)..."
+                    
+                    DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
+                        self.processGroups()
+                    }
+                } else {
+                    // 成功或已达最大重试次数
+                    self.groups = computedGroups
+                    self.isLoading = false
+                    print("✅ [Debug] 匹配完成! 结果: \(computedGroups.count) 组")
+                    
+                    if !isInventoryEmpty && !hasMatches {
+                         self.debugInfo = "未匹配到任何饰品数据，请检查本地数据库"
+                    }
+                }
             }
         }
     }
