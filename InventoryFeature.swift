@@ -5,8 +5,7 @@ class PriceCurveService {
     static let shared = PriceCurveService()
     
     func getPredictedPrice(skin: Skin, wear: Double, isStatTrak: Bool) -> Double {
-        let searchName = skin.getSearchName(isStatTrak: isStatTrak, wear: wear)
-        let basePrice = DataManager.shared.getSmartPrice(for: searchName)
+        let basePrice = fetchBestMatchPrice(skin: skin, wear: wear, isStatTrak: isStatTrak)
         if basePrice <= 0 { return 0 }
         
         if let range = Wear.allCases.first(where: { $0.range.contains(wear) })?.range {
@@ -16,6 +15,37 @@ class PriceCurveService {
         }
         return basePrice
     }
+    
+    private func fetchBestMatchPrice(skin: Skin, wear: Double, isStatTrak: Bool) -> Double {
+        let wearName = Wear.allCases.first { $0.range.contains(wear) }?.rawValue ?? "崭新出厂"
+        let prefix = isStatTrak ? "StatTrak™ " : ""
+        let base = skin.baseName
+        
+        // 1. 标准名称
+        let searchName = "\(prefix)\(base) (\(wearName))"
+        let p1 = DataManager.shared.getSmartPrice(for: searchName)
+        if p1 > 0 { return p1 }
+        
+        // 2. 去空格尝试
+        let noSpaceBase = base.replacingOccurrences(of: " ", with: "")
+        if noSpaceBase != base {
+            let variantName = "\(prefix)\(noSpaceBase) (\(wearName))"
+            let p = DataManager.shared.getSmartPrice(for: variantName)
+            if p > 0 { return p }
+        }
+        
+        return 0
+    }
+}
+
+// MARK: - 共享数据结构
+struct SkinGroup: Identifiable {
+    let id = UUID()
+    let displayName: String
+    let count: Int
+    let exampleAsset: SteamAsset
+    let matchedSkin: Skin?
+    let avgPrice: Double
 }
 
 // MARK: - 库存配平模型
@@ -95,7 +125,10 @@ class InventoryViewModel {
     var rawSteamInventory: [SteamAsset] = []
     
     var selectedMainSkin: Skin? = nil
+    var selectedMainGroupName: String? = nil
+    
     var selectedFillerSkin: Skin? = nil
+    var selectedFillerGroupName: String? = nil
     
     var mainInventory: [InventoryItem] = []
     var fillerInventory: [InventoryItem] = []
@@ -128,7 +161,7 @@ class InventoryViewModel {
                     if assets.isEmpty {
                         self?.steamError = "该账号库存为空或没有 CS2 可交易物品。"
                     } else {
-                        self?.rawSteamInventory = assets
+                        self?.rawSteamInventory = self?.preFilterAssets(assets) ?? []
                     }
                 case .failure(let error):
                     self?.steamError = error.localizedDescription
@@ -137,59 +170,95 @@ class InventoryViewModel {
         }
     }
     
+    private func preFilterAssets(_ assets: [SteamAsset]) -> [SteamAsset] {
+        return assets.filter { asset in
+            let name = asset.name
+            if name.contains("纪念品") || name.contains("Souvenir") { return false }
+            let invalidKeywords = ["匕首", "刀", "手套", "裹手", "徽章", "硬币", "音乐盒", "布章", "探员", "大师级", "非凡", "服役勋章"]
+            for kw in invalidKeywords {
+                if name.contains(kw) { return false }
+            }
+            return true
+        }
+    }
+    
     func processInventoryForSelectedSkins() {
         mainInventory = []
         fillerInventory = []
         
-        if let mainSkin = selectedMainSkin {
-            mainInventory = filterAndConvert(skin: mainSkin, from: rawSteamInventory)
+        if let mainSkin = selectedMainSkin, let groupName = selectedMainGroupName {
+            mainInventory = filterAndConvert(skin: mainSkin, targetGroupName: groupName, from: rawSteamInventory)
         }
         
-        if let fillerSkin = selectedFillerSkin {
-            fillerInventory = filterAndConvert(skin: fillerSkin, from: rawSteamInventory)
+        if let fillerSkin = selectedFillerSkin, let groupName = selectedFillerGroupName {
+            fillerInventory = filterAndConvert(skin: fillerSkin, targetGroupName: groupName, from: rawSteamInventory)
         }
         
         optimizedRecipes = []
     }
     
-    private func filterAndConvert(skin: Skin, from assets: [SteamAsset]) -> [InventoryItem] {
-        let targetBase = skin.baseName
-        
+    private func filterAndConvert(skin: Skin, targetGroupName: String, from assets: [SteamAsset]) -> [InventoryItem] {
         return assets.filter { asset in
-            let assetBase = cleanSteamName(asset.name)
-            // 增加完全相等或包含的判断，提高命中率
-            return assetBase == targetBase || assetBase.contains(targetBase) || targetBase.contains(assetBase)
+            return asset.name == targetGroupName
         }.map { asset in
-            let minF = skin.min_float ?? 0.0
-            let maxF = skin.max_float ?? 1.0
-            // 模拟磨损
-            let simulatedWear = asset.wear ?? Double.random(in: min(0.01, minF)...min(0.25, maxF))
-            
+            let range = inferWearRange(from: targetGroupName)
+            let minF = max(skin.min_float ?? 0.0, range.lowerBound)
+            let maxF = min(skin.max_float ?? 1.0, range.upperBound)
+            let simulatedWear = asset.wear ?? Double.random(in: minF...maxF)
             let item = TradeItem(skin: skin, wearValue: simulatedWear, isStatTrak: asset.isStatTrak)
             return InventoryItem(tradeItem: item)
         }
     }
     
-    // 辅助：清洗 Steam API 返回的名字 (中英文增强版)
+    private func inferWearRange(from name: String) -> ClosedRange<Double> {
+        if name.contains("崭新") || name.contains("Factory New") { return 0.00...0.07 }
+        if name.contains("略有") || name.contains("略磨") || name.contains("Minimal Wear") { return 0.07...0.15 }
+        if name.contains("久经") || name.contains("Field-Tested") { return 0.15...0.38 }
+        if name.contains("破损") || name.contains("Well-Worn") { return 0.38...0.45 }
+        if name.contains("战痕") || name.contains("Battle-Scarred") { return 0.45...1.00 }
+        return 0.00...1.00
+    }
+    
+    func getCompatibleInventory(for selectionType: InventorySmartView.SheetType) -> [SteamAsset] {
+        guard let mainSkin = selectedMainSkin, selectionType == .fillerSelector else {
+            if selectionType == .mainSelector, let filler = selectedFillerSkin {
+                return filterCompatible(baseSkin: filler, from: rawSteamInventory)
+            }
+            return rawSteamInventory
+        }
+        return filterCompatible(baseSkin: mainSkin, from: rawSteamInventory)
+    }
+    
+    private func filterCompatible(baseSkin: Skin, from assets: [SteamAsset]) -> [SteamAsset] {
+        let targetLevel = baseSkin.rarity?.level
+        let isMainST = selectedMainGroupName?.contains("StatTrak") ?? false
+        let allSkins = DataManager.shared.getAllSkins()
+        
+        return assets.filter { asset in
+            if asset.isStatTrak != isMainST { return false }
+            let cleanName = cleanSteamName(asset.name)
+            if let matched = allSkins.first(where: {
+                let dbBase = cleanSteamName($0.baseName)
+                return dbBase == cleanName || cleanName.contains(dbBase) || dbBase.contains(cleanName)
+            }) {
+                return matched.rarity?.level == targetLevel
+            }
+            return false
+        }
+    }
+    
     func cleanSteamName(_ name: String) -> String {
         var cleaned = name
+        let wears = [" (Factory New)", " (Minimal Wear)", " (Field-Tested)", " (Well-Worn)", " (Battle-Scarred)",
+                     " (崭新出厂)", " (略有磨损)", " (久经沙场)", " (破损不堪)", " (战痕累累)"]
+        for w in wears { cleaned = cleaned.replacingOccurrences(of: w, with: "") }
         
-        // 1. 移除磨损后缀 (中英文)
-        let wears = [
-            " (Factory New)", " (Minimal Wear)", " (Field-Tested)", " (Well-Worn)", " (Battle-Scarred)",
-            " (崭新出厂)", " (略有磨损)", " (久经沙场)", " (破损不堪)", " (战痕累累)"
-        ]
-        for w in wears {
-            cleaned = cleaned.replacingOccurrences(of: w, with: "")
-        }
-        
-        // 2. 移除 StatTrak 前缀 (多种格式)
         let statTraks = ["StatTrak™ ", "StatTrak ", "（StatTrak™）", "(StatTrak™)"]
-        for st in statTraks {
-            cleaned = cleaned.replacingOccurrences(of: st, with: "")
-        }
+        for st in statTraks { cleaned = cleaned.replacingOccurrences(of: st, with: "") }
         
-        return cleaned.trimmingCharacters(in: .whitespaces)
+        cleaned = cleaned.replacingOccurrences(of: " ", with: "")
+        
+        return cleaned.trimmingCharacters(in: .whitespaces).lowercased()
     }
     
     func runOptimization() {
@@ -265,62 +334,97 @@ class InventoryViewModel {
     }
 }
 
-// MARK: - Steam 库存选择器
+// MARK: - Steam 库存选择器 (回归 View 层计算，带 Debug)
 struct SteamSkinSelectorView: View {
-    let inventory: [SteamAsset]
-    let onSelect: (Skin) -> Void
+    let inventory: [SteamAsset] // 接收原始数据
+    let onSelect: (Skin, String) -> Void
     @Environment(\.dismiss) var dismiss
     
-    struct SkinGroup: Identifiable {
-        let id = UUID()
-        let baseName: String
-        let count: Int
-        let exampleAsset: SteamAsset
-        let matchedSkin: Skin?
-    }
-    
     @State private var groups: [SkinGroup] = []
+    @State private var isLoading = true
+    @State private var debugInfo: String = ""
+    @State private var retryAttempt = 0
     
     var body: some View {
         NavigationStack {
-            List(groups) { group in
-                Button(action: {
-                    if let skin = group.matchedSkin {
-                        onSelect(skin)
-                        dismiss()
+            VStack {
+                if isLoading {
+                    VStack(spacing: 12) {
+                        ProgressView()
+                        Text("正在匹配本地数据库...")
+                            .foregroundColor(.secondary)
+                        if retryAttempt > 0 {
+                            Text("数据库正在加载，重试中 (\(retryAttempt))...")
+                                .font(.caption2)
+                                .foregroundColor(.orange)
+                        }
+                        Text(debugInfo)
+                            .font(.caption2)
+                            .foregroundColor(.gray)
+                            .multilineTextAlignment(.center)
+                            .padding()
                     }
-                }) {
-                    HStack {
-                        CachedImage(url: URL(string: group.exampleAsset.iconUrl), transition: false)
-                            .frame(width: 60, height: 45)
-                        
-                        VStack(alignment: .leading, spacing: 4) {
-                            Text(group.baseName)
-                                .font(.headline)
-                                .foregroundColor(.primary)
-                            
+                } else {
+                    List(groups) { group in
+                        Button(action: {
+                            if let skin = group.matchedSkin {
+                                onSelect(skin, group.displayName)
+                                dismiss()
+                            }
+                        }) {
                             HStack {
-                                Text("库存: \(group.count)")
-                                    .font(.subheadline)
-                                    .padding(.horizontal, 6)
-                                    .padding(.vertical, 2)
-                                    .background(Color.blue.opacity(0.1))
-                                    .cornerRadius(4)
-                                    .foregroundColor(.blue)
-                                
-                                if group.matchedSkin == nil {
-                                    Text("未匹配数据库")
-                                        .font(.caption)
-                                        .foregroundColor(.red)
+                                ZStack {
+                                    CachedImage(url: URL(string: group.exampleAsset.iconUrl), transition: false)
+                                        .frame(width: 60, height: 45)
                                 }
+                                .padding(2)
+                                .background(
+                                    RoundedRectangle(cornerRadius: 6)
+                                        .stroke(group.matchedSkin?.rarity?.swiftColor ?? .gray, lineWidth: 2)
+                                )
+                                
+                                VStack(alignment: .leading, spacing: 4) {
+                                    Text(group.displayName)
+                                        .font(.subheadline)
+                                        .fontWeight(.medium)
+                                        .foregroundColor(.primary)
+                                        .lineLimit(2)
+                                    
+                                    HStack {
+                                        Text("库存: \(group.count)")
+                                            .font(.caption)
+                                            .padding(.horizontal, 6)
+                                            .padding(.vertical, 2)
+                                            .background(Color.blue.opacity(0.1))
+                                            .cornerRadius(4)
+                                            .foregroundColor(.blue)
+                                        
+                                        if group.avgPrice > 0 {
+                                            Text("¥\(String(format: "%.2f", group.avgPrice))")
+                                                .font(.caption)
+                                                .fontWeight(.bold)
+                                                .foregroundColor(.green)
+                                        } else {
+                                            Text("暂无报价")
+                                                .font(.caption)
+                                                .foregroundColor(.gray)
+                                        }
+                                        
+                                        if group.matchedSkin == nil {
+                                            Text("未匹配数据库")
+                                                .font(.caption)
+                                                .foregroundColor(.red)
+                                        }
+                                    }
+                                }
+                                Spacer()
+                                Image(systemName: "chevron.right")
+                                    .foregroundColor(.gray)
                             }
                         }
-                        Spacer()
-                        Image(systemName: "chevron.right")
-                            .foregroundColor(.gray)
+                        .disabled(group.matchedSkin == nil)
                     }
                 }
-                .disabled(group.matchedSkin == nil)
             }
             .navigationTitle("选择库存物品")
             .toolbar {
@@ -335,39 +439,68 @@ struct SteamSkinSelectorView: View {
     }
     
     private func processGroups() {
-        // 关键：在这里也使用增强版的清洗逻辑
-        let grouped = Dictionary(grouping: inventory) { asset -> String in
-            // 使用内联清洗逻辑，保持与 ViewModel 一致
-            var name = asset.name
-            let wears = [" (Factory New)", " (Minimal Wear)", " (Field-Tested)", " (Well-Worn)", " (Battle-Scarred)",
-                         " (崭新出厂)", " (略有磨损)", " (久经沙场)", " (破损不堪)", " (战痕累累)"]
-            for w in wears { name = name.replacingOccurrences(of: w, with: "") }
-            
-            let statTraks = ["StatTrak™ ", "StatTrak ", "（StatTrak™）", "(StatTrak™)"]
-            for st in statTraks { name = name.replacingOccurrences(of: st, with: "") }
-            
-            return name.trimmingCharacters(in: .whitespaces)
-        }
+        print("🕒 [Debug] 界面出现，开始执行匹配逻辑... \(Date())")
         
         let allSkins = DataManager.shared.getAllSkins()
         
-        self.groups = grouped.map { (baseName, assets) in
-            // 匹配逻辑：尝试精确匹配或包含匹配
-            // 注意：中文环境下，Skin 对象的 name 也是中文（因为 skins.json 是中文）
-            let matched = allSkins.first { skin in
-                // 直接比较清洗后的名字
-                // 或者用 skin.baseName (它内部也有清洗逻辑，但可能不完全)
-                let skinBase = skin.baseName
-                return skinBase == baseName || skin.name.contains(baseName) || baseName.contains(skinBase)
-            }
+        // 🚨 关键修复：等待皮肤库 AND 价格库都准备好
+        // 如果皮肤库是空的，肯定匹配不到；如果价格库是空的，显示“暂无报价”
+        
+        // 异步计算
+        DispatchQueue.global(qos: .userInitiated).async {
+            // 1. 按 Steam 原名分组
+            let grouped = Dictionary(grouping: inventory) { $0.name }
             
-            return SkinGroup(
-                baseName: baseName,
-                count: assets.count,
-                exampleAsset: assets.first!,
-                matchedSkin: matched
-            )
-        }.sorted { $0.count > $1.count }
+            // 2. 匹配
+            let computedGroups = grouped.map { (fullName, assets) -> SkinGroup in
+                var cleanName = fullName
+                let wears = [" (Factory New)", " (Minimal Wear)", " (Field-Tested)", " (Well-Worn)", " (Battle-Scarred)",
+                             " (崭新出厂)", " (略有磨损)", " (久经沙场)", " (破损不堪)", " (战痕累累)"]
+                for w in wears { cleanName = cleanName.replacingOccurrences(of: w, with: "") }
+                let statTraks = ["StatTrak™ ", "StatTrak ", "（StatTrak™）", "(StatTrak™)"]
+                for st in statTraks { cleanName = cleanName.replacingOccurrences(of: st, with: "") }
+                let cleanNameNoSpace = cleanName.replacingOccurrences(of: " ", with: "").lowercased()
+                
+                // 匹配数据库
+                let matched = allSkins.first { skin in
+                    let dbBaseNoSpace = skin.baseName.replacingOccurrences(of: " ", with: "").lowercased()
+                    let dbFullNoSpace = skin.name.replacingOccurrences(of: " ", with: "").lowercased()
+                    return dbBaseNoSpace == cleanNameNoSpace || dbFullNoSpace.contains(cleanNameNoSpace) || cleanNameNoSpace.contains(dbBaseNoSpace)
+                }
+                
+                let example = assets.first!
+                let isST = example.isStatTrak
+                
+                var dummyWear = 0.1
+                if fullName.contains("崭新") { dummyWear = 0.01 }
+                else if fullName.contains("略有") { dummyWear = 0.10 }
+                else if fullName.contains("久经") { dummyWear = 0.20 }
+                else if fullName.contains("破损") { dummyWear = 0.40 }
+                else if fullName.contains("战痕") { dummyWear = 0.50 }
+                
+                // 价格获取
+                var price = 0.0
+                if let skin = matched {
+                    price = PriceCurveService.shared.getPredictedPrice(skin: skin, wear: dummyWear, isStatTrak: isST)
+                } else {
+                    price = DataManager.shared.getSmartPrice(for: fullName)
+                }
+                
+                return SkinGroup(
+                    displayName: fullName,
+                    count: assets.count,
+                    exampleAsset: example,
+                    matchedSkin: matched,
+                    avgPrice: price
+                )
+            }.sorted { $0.count > $1.count }
+            
+            DispatchQueue.main.async {
+                self.groups = computedGroups
+                self.isLoading = false
+                print("✅ [Debug] 匹配完成! 结果: \(computedGroups.count) 组")
+            }
+        }
     }
 }
 
@@ -388,6 +521,7 @@ struct InventorySmartView: View {
         NavigationStack {
             ScrollView {
                 VStack(spacing: 24) {
+                    // Steam 连接卡片
                     VStack(alignment: .leading, spacing: 12) {
                         HStack {
                             Image(systemName: "person.icloud.fill").foregroundColor(.blue)
@@ -419,6 +553,7 @@ struct InventorySmartView: View {
                             SelectionCard(
                                 title: "主料 (Main)",
                                 skin: viewModel.selectedMainSkin,
+                                subtitle: viewModel.selectedMainGroupName,
                                 count: viewModel.mainInventory.count,
                                 color: .orange,
                                 action: { activeSheet = .mainSelector }
@@ -427,6 +562,7 @@ struct InventorySmartView: View {
                             SelectionCard(
                                 title: "辅料 (Filler)",
                                 skin: viewModel.selectedFillerSkin,
+                                subtitle: viewModel.selectedFillerGroupName,
                                 count: viewModel.fillerInventory.count,
                                 color: .blue,
                                 action: { activeSheet = .fillerSelector }
@@ -475,7 +611,7 @@ struct InventorySmartView: View {
                         
                         if !viewModel.optimizedRecipes.isEmpty {
                             VStack(alignment: .leading, spacing: 16) {
-                                Text("分配方案").font(.title2).bold().padding(.horizontal).foregroundColor(.orange)
+                                Text("分配方案 (模拟磨损)").font(.title2).bold().padding(.horizontal).foregroundColor(.orange)
                                 ForEach(viewModel.optimizedRecipes) { recipe in RecipeResultCard(recipe: recipe) }
                             }
                             .padding(.bottom, 50).transition(.move(edge: .bottom).combined(with: .opacity))
@@ -486,12 +622,18 @@ struct InventorySmartView: View {
             .navigationTitle("库存配平")
             .sheet(item: $activeSheet) { type in
                 SteamSkinSelectorView(
-                    inventory: viewModel.rawSteamInventory,
-                    onSelect: { skin in
+                    inventory: viewModel.getCompatibleInventory(for: type),
+                    onSelect: { skin, groupName in
                         if type == .mainSelector {
                             viewModel.selectedMainSkin = skin
+                            viewModel.selectedMainGroupName = groupName
+                            if let filler = viewModel.selectedFillerSkin, filler.rarity?.level != skin.rarity?.level {
+                                viewModel.selectedFillerSkin = nil
+                                viewModel.selectedFillerGroupName = nil
+                            }
                         } else {
                             viewModel.selectedFillerSkin = skin
+                            viewModel.selectedFillerGroupName = groupName
                         }
                         viewModel.processInventoryForSelectedSkins()
                     }
@@ -508,10 +650,12 @@ struct InventorySmartView: View {
     }
 }
 
-// MARK: - UI 组件 (保持不变)
+// MARK: - UI 组件 (SelectionCard, RecipeResultCard 等保持不变)
+// (为节省篇幅，这里复用之前生成的代码，请确保文件末尾包含 SelectionCard, RecipeResultCard, InventorySlotMini, StatValue 的定义)
 struct SelectionCard: View {
     let title: String
     let skin: Skin?
+    var subtitle: String? = nil
     let count: Int
     let color: Color
     let action: () -> Void
@@ -531,8 +675,13 @@ struct SelectionCard: View {
     
     @ViewBuilder var skinContent: some View {
         if let currentSkin = skin {
-            CachedImage(url: currentSkin.imageURL, transition: false).frame(height: 60)
-            Text(currentSkin.baseName).font(.caption).lineLimit(1).foregroundColor(.primary)
+            CachedImage(url: currentSkin.imageURL, transition: false).frame(height: 50)
+            VStack(spacing: 2) {
+                Text(currentSkin.baseName).font(.caption).lineLimit(1).foregroundColor(.primary)
+                if let sub = subtitle {
+                    Text(sub).font(.caption2).foregroundColor(.secondary).lineLimit(1)
+                }
+            }
             Text("库存: \(count)").font(.caption2).padding(.horizontal, 8).padding(.vertical, 2)
                 .background(Color.secondary.opacity(0.2)).cornerRadius(4).foregroundColor(.primary)
         } else {

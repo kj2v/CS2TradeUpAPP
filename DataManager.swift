@@ -14,8 +14,8 @@ class DataManager {
     var errorMessage: String?
     
     init() {
-        loadSkins()
-        loadRealPrices() // 🔴 切换为加载真实数据
+        loadSkins() // ✅ 直接加载本地
+        loadRealPrices()
     }
     
     // MARK: - 加载真实爬取的价格数据
@@ -40,6 +40,7 @@ class DataManager {
                 newMap[item.name] = item
             }
             
+            // 在主线程更新 UI 相关数据
             DispatchQueue.main.async {
                 self.priceMap = newMap
                 print("💰 真实价格库加载完成: \(newMap.count) 条报价")
@@ -68,41 +69,37 @@ class DataManager {
         return priceMap[skinName]?.rawPrice ?? 0.0
     }
     
-    // MARK: - 皮肤加载 (保持不变)
+    // MARK: - 皮肤加载 (仅本地)
     func loadSkins() {
         isLoading = true
-        Task {
-            do {
-                let skins = try await fetchSkinsFromNetwork()
-                await MainActor.run {
-                    self.allSkins = skins
-                    self.isLoading = false
-                    print("🎉 皮肤元数据加载成功")
-                }
-            } catch {
-                let localSkins = loadSkinsFromBundle()
-                await MainActor.run {
-                    self.allSkins = localSkins
-                    self.isLoading = false
-                }
-            }
+        print("📂 正在加载本地 skins.json ...")
+        
+        // 直接同步加载，不再使用 Task 和网络请求
+        let localSkins = loadSkinsFromBundle()
+        self.allSkins = localSkins
+        self.isLoading = false
+        
+        if localSkins.isEmpty {
+            print("⚠️ 警告：本地 skins.json 未找到或解析为空")
+        } else {
+            print("🎉 皮肤元数据加载成功: \(localSkins.count) 个条目")
         }
-    }
-    
-    private func fetchSkinsFromNetwork() async throws -> [Skin] {
-        let urlString = "https://mirror.ghproxy.com/https://raw.githubusercontent.com/ByMykel/CSGO-API/main/public/data/zh-CN/skins.json"
-        guard let url = URL(string: urlString) else { throw URLError(.badURL) }
-        var request = URLRequest(url: url)
-        request.timeoutInterval = 8
-        let (data, _) = try await URLSession.shared.data(for: request)
-        return try JSONDecoder().decode([Skin].self, from: data).filter { $0.image != nil }
     }
     
     private func loadSkinsFromBundle() -> [Skin] {
-        guard let url = Bundle.main.url(forResource: "skins", withExtension: "json") else { return [] }
-        if let data = try? Data(contentsOf: url) {
-            return (try? JSONDecoder().decode([Skin].self, from: data)) ?? []
+        guard let url = Bundle.main.url(forResource: "skins", withExtension: "json") else {
+            print("❌ 错误：Bundle 中找不到 skins.json")
+            return []
         }
-        return []
+        
+        do {
+            let data = try Data(contentsOf: url)
+            // 过滤掉没有图片的皮肤，保持数据整洁
+            let decodedSkins = try JSONDecoder().decode([Skin].self, from: data)
+            return decodedSkins.filter { $0.image != nil }
+        } catch {
+            print("❌ 本地 skins.json 解析失败: \(error)")
+            return []
+        }
     }
 }
