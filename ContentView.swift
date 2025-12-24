@@ -50,6 +50,108 @@ extension Skin {
     }
 }
 
+// MARK: - 新增：模糊匹配价格助手
+// 将 InventoryFeature 中的逻辑复用于此，解决 CZ75、USP 等翻译不一致问题
+class FuzzyPriceHelper {
+    static func getPrice(skin: Skin, wear: Double, isStatTrak: Bool) -> Double {
+        let wearName = Wear.allCases.first { $0.range.contains(wear) }?.rawValue ?? "崭新出厂"
+        // 注意：skin.baseName 已经去除了 StatTrak 文本，只剩 "武器 | 皮肤"
+        let base = skin.baseName
+        
+        // 逻辑复刻 InventoryFeature
+        let prefix = isStatTrak ? "（StatTrak™）" : ""
+        
+        // 1. 标准匹配
+        // 尝试: "（StatTrak™）Galil AR | 冰核聚变 (崭新出厂)" (如果 DataManager 能处理这种格式)
+        // 或者配合下方的 fuzzyRules 逻辑
+        let searchName = base.contains(" | ") ? base.replacingOccurrences(of: " | ", with: "\(prefix) | ") + " (\(wearName))" : "\(base)\(prefix)" + " (\(wearName))"
+        print(searchName)
+        if let p = check(searchName) { return p }
+        
+        // 备用：标准 StatTrak 前缀匹配 (StatTrak™ AK-47...)
+        if isStatTrak {
+             let altPrefix = "StatTrak™ "
+             let altName = "\(altPrefix)\(base) (\(wearName))"
+             if let p = check(altName) { return p }
+        }
+        
+        // 2. 去空格
+        let noSpaceBase = base.replacingOccurrences(of: " ", with: "")
+        if noSpaceBase != base {
+            let variantName = "\(prefix)\(noSpaceBase) (\(wearName))"
+            if let p = check(variantName) { return p }
+        }
+        
+        // 3. 模糊匹配
+        if let p = fetchFuzzyPrice(base: base, wearName: wearName, prefix: prefix) { return p }
+        
+        return 0.0
+    }
+    
+    private static func fetchFuzzyPrice(base: String, wearName: String, prefix: String) -> Double? {
+        let parts = base.components(separatedBy: " | ")
+        guard parts.count == 2 else { return nil }
+        
+        let skinMapping = ["崩络克18型": "崩络克-18"]
+        
+        let weaponRaw = parts[0]
+        let skinName = skinMapping[parts[1]] ?? parts[1]
+        
+        let fuzzyRules: [(String, [String])] = [
+            ("加利尔", ["加利尔 AR", "加利尔", "Galil AR"]),
+            ("USP", ["USP 消音版", "USP-S", "USP"]),
+            ("格洛克", ["格洛克 18 型", "格洛克 18", "格洛克", "Glock-18"]),
+            ("CZ75", ["CZ75 自动手枪", "CZ75-Auto", "CZ75"]),
+            ("沙漠之鹰", ["沙漠之鹰", "Desert Eagle"]),
+            ("FN57", ["FN57", "Five-SeveN"]),
+            ("双持贝瑞塔", ["双持贝瑞塔", "Dual Berettas"]),
+            ("M4A1", ["M4A1 消音型", "M4A1-S", "M4A1"]),
+            ("MAC-10", ["MAC-10", "MAC-10 冲锋枪"]),
+            ("MP9", ["MP9", "MP9 冲锋枪"]),
+            ("R8", ["R8 左轮手枪", "R8 Revolver"]),
+            ("SSG", ["SSG 08", "鸟狙"]),
+            ("鸟狙", ["SSG 08", "鸟狙"]),
+            ("SCAR", ["SCAR-20", "SCAR-20 自动狙击步枪"]),
+            ("G3SG1", ["G3SG1", "G3SG1 自动狙击步枪"]),
+            ("法玛斯", ["法玛斯", "FAMAS"]),
+            ("野牛", ["PP-野牛", "PP-Bizon"]),
+            ("MP7", ["MP7", "MP7 冲锋枪"]),
+            ("P90", ["P90", "P90 冲锋枪"]),
+            ("UMP-45", ["UMP-45", "UMP-45 冲锋枪"]),
+            ("MAG-7", ["MAG-7", "警喷"]),
+            ("XM1014", ["XM1014", "自动霰弹枪"]),
+            ("新星", ["新星", "Nova"]),
+            ("截短", ["截短霰弹枪", "Sawed-Off"]),
+            ("M249", ["M249"]),
+            ("电击枪", ["宙斯 X27 电击枪"])
+        ]
+        
+        for (keyword, replacements) in fuzzyRules {
+            if weaponRaw.contains(keyword) || weaponRaw.localizedCaseInsensitiveContains(keyword) {
+                for rep in replacements {
+                    // 构造逻辑：替换后的武器名 + 前缀(StatTrak) + | + 皮肤名
+                    // 例如: 加利尔 AR（StatTrak™） | 冰核聚变 (崭新出厂)
+                    let tryName = "\(rep)\(prefix) | \(skinName) (\(wearName))"
+                    if let p = check(tryName) { return p }
+                }
+            }
+        }
+        
+        if weaponRaw.contains(" AR") {
+            let simpleRep = weaponRaw.replacingOccurrences(of: " AR", with: "")
+            let tryName = "\(prefix)\(simpleRep) | \(skinName) (\(wearName))"
+            if let p = check(tryName) { return p }
+        }
+        
+        return nil
+    }
+    
+    private static func check(_ name: String) -> Double? {
+        let p = DataManager.shared.getSmartPrice(for: name)
+        return p > 0 ? p : nil
+    }
+}
+
 // MARK: - 2. 数据模型
 
 struct TradeItem: Identifiable, Equatable, Codable {
@@ -72,12 +174,16 @@ struct TradeItem: Identifiable, Equatable, Codable {
     
     var displayName: String {
         let n = skin.baseName
-        return isStatTrak ? "StatTrak™ \(n)" : n
+        if isStatTrak {
+            // 将 StatTrak™ 拼接到枪名后，竖杠前
+            return n.contains(" | ") ? n.replacingOccurrences(of: " | ", with: "（StatTrak™） | ") : "\(n)（StatTrak™）"
+        }
+        return n
     }
     
     var price: Double {
-        let searchName = skin.getSearchName(isStatTrak: isStatTrak, wear: wearValue)
-        return DataManager.shared.getSmartPrice(for: searchName)
+        // 使用 FuzzyPriceHelper 替代原有的 getSearchName
+        return FuzzyPriceHelper.getPrice(skin: skin, wear: wearValue, isStatTrak: isStatTrak)
     }
 }
 
@@ -102,7 +208,15 @@ struct SelectableSkinWrapper: Identifiable {
     var id: String { return isStatTrak ? "\(skin.id)_st" : skin.id }
     let skin: Skin
     let isStatTrak: Bool
-    var displayName: String { return isStatTrak ? "StatTrak™ \(skin.baseName)" : skin.baseName }
+    
+    var displayName: String {
+        let n = skin.baseName
+        if isStatTrak {
+            // 将 StatTrak™ 拼接到枪名后，竖杠前
+            return n.contains(" | ") ? n.replacingOccurrences(of: " | ", with: "（StatTrak™） | ") : "\(n)（StatTrak™）"
+        }
+        return n
+    }
     
     func getPreviewPrice(for wearFilter: Wear?) -> String {
         var targetWear = skin.min_float ?? 0
@@ -112,8 +226,8 @@ struct SelectableSkinWrapper: Identifiable {
         } else {
             targetWear = max(targetWear, 0.035)
         }
-        let searchName = skin.getSearchName(isStatTrak: isStatTrak, wear: targetWear)
-        let price = DataManager.shared.getSmartPrice(for: searchName)
+        // 使用 FuzzyPriceHelper
+        let price = FuzzyPriceHelper.getPrice(skin: skin, wear: targetWear, isStatTrak: isStatTrak)
         return price > 0 ? String(format: "¥%.2f", price) : "---"
     }
 }
@@ -297,8 +411,8 @@ class TradeUpViewModel {
             probs[item.id] = res.probability
             groups[dispName]?.append(item)
             
-            let priceName = res.skin.getSearchName(isStatTrak: res.isStatTrak, wear: res.wear)
-            let price = DataManager.shared.getSmartPrice(for: priceName)
+            // 使用 FuzzyPriceHelper 获取产物价格
+            let price = FuzzyPriceHelper.getPrice(skin: res.skin, wear: res.wear, isStatTrak: res.isStatTrak)
             totalEV += price * res.probability
         }
         
@@ -1188,9 +1302,9 @@ struct WearEditorView: View {
     var cleanName: String { return skin.baseName }
     
     var dynamicPrice: String {
-        let currentWearName = getWearName(for: sliderValue)
-        let searchName = "\(cleanName) (\(currentWearName))"
-        let price = DataManager.shared.getSmartPrice(for: searchName)
+        // 使用 FuzzyPriceHelper 获取动态价格，默认为非 StatTrak（因为编辑器没传状态）
+        // 如果需要精确显示 StatTrak 价格，WearEditorView 需要接受 isStatTrak 参数
+        let price = FuzzyPriceHelper.getPrice(skin: skin, wear: sliderValue, isStatTrak: false)
         return price > 0 ? String(format: "¥%.2f", price) : "---"
     }
     
