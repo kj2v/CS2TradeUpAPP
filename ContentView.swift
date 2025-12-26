@@ -1,4 +1,159 @@
 import SwiftUI
+import Combine
+
+// MARK: - 0. 新增：库存管理器 (InventoryManager) - 完整修复版
+class InventoryManager: ObservableObject {
+    // 1. 底层静态存储 (所有实例共享)
+    private static var _sharedStorage: [TradeItem] = []
+    // 2. 静态通知器
+    private static let _updateSubject = PassthroughSubject<[TradeItem], Never>()
+    
+    // 实例属性
+    @Published var inventory: [TradeItem] = []
+    @Published var isLoading: Bool = false
+    
+    // 🔥 修改：状态拆分，解决后台运行问题
+    @Published var isFetching: Bool = false        // 逻辑状态：任务是否正在运行
+    @Published var showFetchModal: Bool = false    // UI状态：是否显示全屏遮罩
+    @Published var fetchProgress: String = ""
+    
+    // 🔥 新增：任务句柄，用于防重和取消
+    private var fetchTask: Task<Void, Never>?
+    
+    var steamInventory: [TradeItem] {
+        get { inventory }
+        set { updateData(newValue) }
+    }
+    
+    private var cancellables = Set<AnyCancellable>()
+    
+    init() {
+        self.inventory = InventoryManager._sharedStorage
+        
+        InventoryManager._updateSubject
+            .receive(on: RunLoop.main)
+            .sink { [weak self] newItems in
+                guard let self = self else { return }
+                if self.inventory != newItems {
+                    self.inventory = newItems
+                }
+            }
+            .store(in: &cancellables)
+    }
+    
+    // 统一更新入口
+    func updateData(_ newItems: [TradeItem]) {
+        self.inventory = newItems
+        InventoryManager._sharedStorage = newItems
+        InventoryManager._updateSubject.send(newItems)
+    }
+    
+    func setInventory(_ items: [TradeItem]) {
+        updateData(items)
+    }
+    
+    func hasItems() -> Bool {
+        return !inventory.isEmpty
+    }
+    
+    // 核心功能 1：从全局缓存刷新磨损
+    func refreshWearsFromCache() {
+        var hasUpdates = false
+        var currentItems = self.inventory
+        
+        for (index, item) in currentItems.enumerated() {
+            if let link = item.inspectLink,
+               let cachedWear = InventoryWearFetchService.shared.getCachedWear(for: link),
+               abs(item.wearValue - cachedWear) > 0.0000001 {
+                
+                print("♻️ [InventoryManager] 从缓存同步磨损: \(item.skin.name) -> \(cachedWear)")
+                currentItems[index].wearValue = cachedWear
+                hasUpdates = true
+            }
+        }
+        
+        if hasUpdates {
+            updateData(currentItems)
+        }
+    }
+    
+    // 🔥 核心功能 2：主动爬取 (修复崩溃逻辑)
+    func fetchMissingWears(forceRestart: Bool = false) {
+        // 1. 防重保护
+        if isFetching && !forceRestart {
+            print("⚠️ [InventoryManager] 任务正在运行，跳过重复请求")
+            // 如果希望切回来能看到进度条，可以解开下面这行
+            // showFetchModal = true
+            return
+        }
+        
+        // 2. 取消旧任务
+        fetchTask?.cancel()
+        
+        let missingItems = inventory.filter { item in
+            guard let link = item.inspectLink else { return false }
+            return InventoryWearFetchService.shared.getCachedWear(for: link) == nil
+        }
+        
+        if missingItems.isEmpty {
+            refreshWearsFromCache()
+            return
+        }
+        
+        // 3. 启动新任务
+        isFetching = true
+        showFetchModal = true
+        let total = missingItems.count
+        
+        fetchTask = Task {
+            print("🚀 [InventoryManager] 开始爬取任务，目标数量: \(total)")
+            
+            for (index, item) in missingItems.enumerated() {
+                if Task.isCancelled { break }
+                
+                await MainActor.run {
+                    self.fetchProgress = "正在获取磨损 (\(index + 1)/\(total))..."
+                }
+                
+                if let link = item.inspectLink {
+                    await withCheckedContinuation { continuation in
+                        InventoryWearFetchService.shared.fetchWear(inspectLink: link) { _ in
+                            continuation.resume()
+                        }
+                    }
+                }
+                
+                // 实时刷新 UI
+                await MainActor.run {
+                    self.refreshWearsFromCache()
+                }
+                
+                // 间隔，防止 API 限制
+                try? await Task.sleep(nanoseconds: 600_000_000)
+            }
+            
+            await MainActor.run {
+                self.isFetching = false
+                self.showFetchModal = false
+                self.fetchProgress = ""
+                self.refreshWearsFromCache()
+                print("✅ [InventoryManager] 爬取任务结束")
+            }
+        }
+    }
+    
+    // 后台运行：只关弹窗，不关任务
+    func runInBackground() {
+        showFetchModal = false
+    }
+    
+    // 强制停止
+    func stopFetching() {
+        fetchTask?.cancel()
+        isFetching = false
+        showFetchModal = false
+    }
+}
 
 // MARK: - 1. 基础扩展与适配
 
@@ -50,41 +205,91 @@ extension Skin {
     }
 }
 
-// MARK: - 新增：模糊匹配价格助手
-// 将 InventoryFeature 中的逻辑复用于此，解决 CZ75、USP 等翻译不一致问题
+// MARK: - 智能价格服务
 class FuzzyPriceHelper {
     static func getPrice(skin: Skin, wear: Double, isStatTrak: Bool) -> Double {
-        let wearName = Wear.allCases.first { $0.range.contains(wear) }?.rawValue ?? "崭新出厂"
-        // 注意：skin.baseName 已经去除了 StatTrak 文本，只剩 "武器 | 皮肤"
-        let base = skin.baseName
+        let basePrice = fetchBasePrice(skin: skin, wear: wear, isStatTrak: isStatTrak)
+        if basePrice <= 0 { return 0 }
         
-        // 逻辑复刻 InventoryFeature
+        guard let currentWear = Wear.allCases.first(where: { $0.range.contains(wear) }) else { return basePrice }
+        
+        let range = currentWear.range
+        let rangeSpan = range.upperBound - range.lowerBound
+        let qualityRatio = rangeSpan > 0 ? (range.upperBound - wear) / rangeSpan : 0
+        
+        var ceilingPrice: Double = 0.0
+        if let betterWear = getBetterWear(for: currentWear) {
+            let dummyFloat = (betterWear.range.lowerBound + betterWear.range.upperBound) / 2.0
+            ceilingPrice = fetchBasePrice(skin: skin, wear: dummyFloat, isStatTrak: isStatTrak)
+        }
+        
+        if ceilingPrice > basePrice {
+            var ratioFactor = 0.75
+            if currentWear == .fieldTested { ratioFactor = 0.85 }
+            else if currentWear == .minimalWear { ratioFactor = 0.80 }
+            
+            let anchorPrice = ceilingPrice * ratioFactor
+            if anchorPrice > basePrice {
+                let priceGap = anchorPrice - basePrice
+                let interpolatedPrice = basePrice + (priceGap * qualityRatio)
+                return min(interpolatedPrice, ceilingPrice * 0.95)
+            }
+        }
+        
+        if currentWear == .factoryNew {
+            let multiplier = 1.0 + (qualityRatio * 1.5)
+            return basePrice * multiplier
+        }
+        
+        return basePrice * (1.0 + qualityRatio * 0.05)
+    }
+    
+    static func getBasePrice(skin: Skin, wear: Double, isStatTrak: Bool) -> Double {
+        return fetchBasePrice(skin: skin, wear: wear, isStatTrak: isStatTrak)
+    }
+    
+    private static func getBetterWear(for wear: Wear) -> Wear? {
+        switch wear {
+        case .battleScarred: return .wellWorn
+        case .wellWorn: return .fieldTested
+        case .fieldTested: return .minimalWear
+        case .minimalWear: return .factoryNew
+        case .factoryNew: return nil
+        }
+    }
+    
+    private static func fetchBasePrice(skin: Skin, wear: Double, isStatTrak: Bool) -> Double {
+        let wearName = Wear.allCases.first { $0.range.contains(wear) }?.rawValue ?? "崭新出厂"
+        let base = skin.baseName
         let prefix = isStatTrak ? "（StatTrak™）" : ""
         
-        // 1. 标准匹配
-        // 尝试: "（StatTrak™）Galil AR | 冰核聚变 (崭新出厂)" (如果 DataManager 能处理这种格式)
-        // 或者配合下方的 fuzzyRules 逻辑
-        let searchName = base.contains(" | ") ? base.replacingOccurrences(of: " | ", with: "\(prefix) | ") + " (\(wearName))" : "\(base)\(prefix)" + " (\(wearName))"
-        print(searchName)
-        if let p = check(searchName) { return p }
+        var standardName = ""
+        if isStatTrak && base.contains(" | ") {
+            standardName = base.replacingOccurrences(of: " | ", with: "\(prefix) | ") + " (\(wearName))"
+        } else {
+            standardName = "\(base)\(prefix) (\(wearName))"
+        }
         
-        // 备用：标准 StatTrak 前缀匹配 (StatTrak™ AK-47...)
+        if let p = check(standardName) { return p }
+        
         if isStatTrak {
              let altPrefix = "StatTrak™ "
              let altName = "\(altPrefix)\(base) (\(wearName))"
              if let p = check(altName) { return p }
         }
         
-        // 2. 去空格
         let noSpaceBase = base.replacingOccurrences(of: " ", with: "")
         if noSpaceBase != base {
-            let variantName = "\(prefix)\(noSpaceBase) (\(wearName))"
+            var variantName = ""
+            if isStatTrak && noSpaceBase.contains("|") {
+                 variantName = noSpaceBase.replacingOccurrences(of: "|", with: "\(prefix)|") + " (\(wearName))"
+            } else {
+                 variantName = "\(noSpaceBase)\(prefix) (\(wearName))"
+            }
             if let p = check(variantName) { return p }
         }
         
-        // 3. 模糊匹配
         if let p = fetchFuzzyPrice(base: base, wearName: wearName, prefix: prefix) { return p }
-        
         return 0.0
     }
     
@@ -92,10 +297,8 @@ class FuzzyPriceHelper {
         let parts = base.components(separatedBy: " | ")
         guard parts.count == 2 else { return nil }
         
-        let skinMapping = ["崩络克18型": "崩络克-18"]
-        
         let weaponRaw = parts[0]
-        let skinName = skinMapping[parts[1]] ?? parts[1]
+        let skinName = parts[1]
         
         let fuzzyRules: [(String, [String])] = [
             ("加利尔", ["加利尔 AR", "加利尔", "Galil AR"]),
@@ -129,8 +332,6 @@ class FuzzyPriceHelper {
         for (keyword, replacements) in fuzzyRules {
             if weaponRaw.contains(keyword) || weaponRaw.localizedCaseInsensitiveContains(keyword) {
                 for rep in replacements {
-                    // 构造逻辑：替换后的武器名 + 前缀(StatTrak) + | + 皮肤名
-                    // 例如: 加利尔 AR（StatTrak™） | 冰核聚变 (崭新出厂)
                     let tryName = "\(rep)\(prefix) | \(skinName) (\(wearName))"
                     if let p = check(tryName) { return p }
                 }
@@ -139,7 +340,7 @@ class FuzzyPriceHelper {
         
         if weaponRaw.contains(" AR") {
             let simpleRep = weaponRaw.replacingOccurrences(of: " AR", with: "")
-            let tryName = "\(prefix)\(simpleRep) | \(skinName) (\(wearName))"
+            let tryName = "\(simpleRep)\(prefix) | \(skinName) (\(wearName))"
             if let p = check(tryName) { return p }
         }
         
@@ -159,31 +360,34 @@ struct TradeItem: Identifiable, Equatable, Codable {
     let skin: Skin
     var wearValue: Double
     var isStatTrak: Bool
+    var inspectLink: String?
     
-    init(skin: Skin, wearValue: Double, isStatTrak: Bool) {
+    init(skin: Skin, wearValue: Double, isStatTrak: Bool, inspectLink: String? = nil) {
         self.id = UUID()
         self.skin = skin
         self.wearValue = wearValue
         self.isStatTrak = isStatTrak
+        self.inspectLink = inspectLink
     }
     
     static func == (lhs: TradeItem, rhs: TradeItem) -> Bool {
-        // 严格比较：ID、磨损值、暗金状态都必须一致
         return lhs.id == rhs.id && abs(lhs.wearValue - rhs.wearValue) < 0.0000001 && lhs.isStatTrak == rhs.isStatTrak
     }
     
     var displayName: String {
         let n = skin.baseName
         if isStatTrak {
-            // 将 StatTrak™ 拼接到枪名后，竖杠前
             return n.contains(" | ") ? n.replacingOccurrences(of: " | ", with: "（StatTrak™） | ") : "\(n)（StatTrak™）"
         }
         return n
     }
     
     var price: Double {
-        // 使用 FuzzyPriceHelper 替代原有的 getSearchName
         return FuzzyPriceHelper.getPrice(skin: skin, wear: wearValue, isStatTrak: isStatTrak)
+    }
+    
+    var outcomePrice: Double {
+        return FuzzyPriceHelper.getBasePrice(skin: skin, wear: wearValue, isStatTrak: isStatTrak)
     }
 }
 
@@ -211,11 +415,15 @@ struct SelectableSkinWrapper: Identifiable {
     
     var displayName: String {
         let n = skin.baseName
-        if isStatTrak {
-            // 将 StatTrak™ 拼接到枪名后，竖杠前
-            return n.contains(" | ") ? n.replacingOccurrences(of: " | ", with: "（StatTrak™） | ") : "\(n)（StatTrak™）"
+        return isStatTrak ? "StatTrak™ \(n)" : n
+    }
+    
+    func getDisplayName(for wearFilter: Wear?) -> String {
+        let base = displayName
+        if let wear = wearFilter {
+            return "\(base) (\(wear.rawValue))"
         }
-        return n
+        return base
     }
     
     func getPreviewPrice(for wearFilter: Wear?) -> String {
@@ -226,8 +434,7 @@ struct SelectableSkinWrapper: Identifiable {
         } else {
             targetWear = max(targetWear, 0.035)
         }
-        // 使用 FuzzyPriceHelper
-        let price = FuzzyPriceHelper.getPrice(skin: skin, wear: targetWear, isStatTrak: isStatTrak)
+        let price = FuzzyPriceHelper.getBasePrice(skin: skin, wear: targetWear, isStatTrak: isStatTrak)
         return price > 0 ? String(format: "¥%.2f", price) : "---"
     }
 }
@@ -247,34 +454,25 @@ class TradeUpViewModel {
     var expectedValue: Double = 0.0
     var roi: Double = 0.0
     
-    // MARK: - 状态快照机制 (Snapshot)
-    // 用于对比是否发生了更改
     private var originalSnapshot: [TradeItem] = []
     
-    // MARK: - 配方编辑状态追踪
-    // 监听 ID 变化，自动记录快照
     var currentEditingRecipeId: UUID? = nil {
         didSet {
             if currentEditingRecipeId != nil {
-                // 进入编辑模式时，记录当前状态为“原始状态”
                 snapshotState()
             } else {
-                // 退出编辑模式，清空快照
                 originalSnapshot = []
             }
         }
     }
     var currentEditingRecipeTitle: String = ""
     
-    // 检查是否有未保存的更改
     var hasUnsavedChanges: Bool {
         guard currentEditingRecipeId != nil else { return false }
         let currentItems = slots.compactMap { $0 }
-        // 比较当前项和快照是否一致
         return currentItems != originalSnapshot
     }
     
-    // 手动更新快照（通常在保存成功后调用）
     func snapshotState() {
         originalSnapshot = slots.compactMap { $0 }
     }
@@ -317,12 +515,8 @@ class TradeUpViewModel {
         
         for skin in allSkins {
             if !isValidInput(skin) { continue }
-            
             if let targetLv = reqLevel, let skinLv = skin.rarity?.level, skinLv != targetLv { continue }
-            
-            if let wear = filterWear {
-                if !skin.supports(wear: wear) { continue }
-            }
+            if let wear = filterWear { if !skin.supports(wear: wear) { continue } }
             
             let matchNormal = (reqST == nil || reqST == false) && (filterStatTrak == 0 || filterStatTrak == 2)
             let matchST = (reqST == nil || reqST == true) && (filterStatTrak == 0 || filterStatTrak == 1) && skin.canBeStatTrak
@@ -336,6 +530,11 @@ class TradeUpViewModel {
     func updateSlot(index: Int, wrapper: SelectableSkinWrapper, wear: Double) {
         let newItem = TradeItem(skin: wrapper.skin, wearValue: wear, isStatTrak: wrapper.isStatTrak)
         slots[index] = newItem
+        resetResult()
+    }
+    
+    func updateSlotWithItem(index: Int, item: TradeItem) {
+        slots[index] = item
         resetResult()
     }
     
@@ -369,14 +568,11 @@ class TradeUpViewModel {
         roi = 0.0
     }
     
-    // 退出编辑模式
     func exitEditMode() {
         currentEditingRecipeId = nil
         currentEditingRecipeTitle = ""
-        // 注意：不清除 slots，允许用户基于旧配方修改后存为新配方
     }
     
-    // 新增：完全重置（用于清空按钮等）
     func clearAll() {
         slots = Array(repeating: nil, count: 10)
         resetResult()
@@ -387,7 +583,6 @@ class TradeUpViewModel {
     
     func simulate() {
         if !validateTradeUp() { showValidationError = true; return }
-        
         let inputs = slots.compactMap { $0 }
         let (_, results) = performSimulation(inputs: inputs)
         
@@ -399,7 +594,6 @@ class TradeUpViewModel {
         
         var groups: [String: [TradeItem]] = [:]
         var probs: [UUID: Double] = [:]
-        
         var totalEV = 0.0
         
         for res in results {
@@ -411,8 +605,7 @@ class TradeUpViewModel {
             probs[item.id] = res.probability
             groups[dispName]?.append(item)
             
-            // 使用 FuzzyPriceHelper 获取产物价格
-            let price = FuzzyPriceHelper.getPrice(skin: res.skin, wear: res.wear, isStatTrak: res.isStatTrak)
+            let price = FuzzyPriceHelper.getBasePrice(skin: res.skin, wear: res.wear, isStatTrak: res.isStatTrak)
             totalEV += price * res.probability
         }
         
@@ -421,15 +614,9 @@ class TradeUpViewModel {
         }
         
         DataManager.shared.tempProbabilities = probs
-        
         self.expectedValue = totalEV
         let cost = calculateTotalCost()
-        if cost > 0 {
-            self.roi = (totalEV - cost) / cost
-        } else {
-            self.roi = 0
-        }
-        
+        if cost > 0 { self.roi = (totalEV - cost) / cost } else { self.roi = 0 }
         hasCalculated = true
     }
     
@@ -443,7 +630,6 @@ class TradeUpViewModel {
         let activeAvgDef = totalDef / 10.0
         
         var outcomeMap: [String: (skin: Skin, prob: Double)] = [:]
-        
         let inputLevel = inputs[0].skin.rarity?.level ?? 0
         let isStattrakInput = inputs[0].isStatTrak
         let nextLevel = inputLevel + 1
@@ -451,7 +637,6 @@ class TradeUpViewModel {
         for item in inputs {
             let rawCol = DataManager.shared.getCollectionName(for: item.skin)
             let outcomes = DataManager.shared.getSkinsByLevelSmart(collectionRawName: rawCol, level: nextLevel)
-            
             if outcomes.isEmpty { continue }
             
             let probShare = 0.1 / Double(outcomes.count)
@@ -466,16 +651,13 @@ class TradeUpViewModel {
         }
         
         var results: [SimulationResult] = []
-        
         for (_, val) in outcomeMap {
             let outSkin = val.skin
             let outMin = outSkin.min_float ?? 0
             let outMax = outSkin.max_float ?? 1
-            
             let resFloat = activeAvgDef * (outMax - outMin) + outMin
             results.append(SimulationResult(skin: outSkin, wear: resFloat, probability: val.prob, isStatTrak: isStattrakInput))
         }
-        
         results.sort { $0.probability > $1.probability }
         return (0, results)
     }
@@ -602,24 +784,26 @@ enum activeSheet: Identifiable {
 
 struct ContentView: View {
     @State private var viewModel = TradeUpViewModel()
+    @StateObject private var inventoryManager = InventoryManager()
+    
     @State private var activeSheetItem: activeSheet?
     @State private var pendingEditorIndex: Int?
-    @State private var selectedTab = 0 // 添加 Tab 选中状态管理
+    @State private var selectedTab = 0
     
     var body: some View {
-        TabView(selection: $selectedTab) { // 绑定选中状态
-            CustomTradeUpView(viewModel: viewModel, activeSheetItem: $activeSheetItem, pendingEditorIndex: $pendingEditorIndex)
-                .tabItem { Label("新建配方", systemImage: "hammer.fill") } // 修改标题
-                .tag(0) // Tag 0
+        TabView(selection: $selectedTab) {
+            CustomTradeUpView(viewModel: viewModel, inventoryManager: inventoryManager, activeSheetItem: $activeSheetItem, pendingEditorIndex: $pendingEditorIndex, selectedTab: $selectedTab)
+                .tabItem { Label("新建配方", systemImage: "hammer.fill") }
+                .tag(0)
             
-            // 修改这里：接入 InventorySmartView
-            InventorySmartView()
+            InventorySmartView(tradeUpViewModel: viewModel, selectedTab: $selectedTab)
+                .environmentObject(inventoryManager)
                 .tabItem { Label("库存配平", systemImage: "wand.and.stars") }
-                .tag(1) // Tag 1
+                .tag(1)
                 
-            MyRecipesView(viewModel: viewModel, selectedTab: $selectedTab) // 传入共享状态
+            MyRecipesView(viewModel: viewModel, selectedTab: $selectedTab)
                 .tabItem { Label("我的配方", systemImage: "list.bullet.clipboard") }
-                .tag(2) // Tag 2
+                .tag(2)
         }
         .sheet(item: $activeSheetItem, onDismiss: {
             if let index = pendingEditorIndex {
@@ -633,10 +817,16 @@ struct ContentView: View {
             case .selector(let index):
                 SkinSelectorView(
                     viewModel: viewModel,
+                    inventoryManager: inventoryManager,
                     slotIndex: index,
+                    selectedTab: $selectedTab,
                     onSkinSelected: { wrapper, initialWear in
                         viewModel.updateSlot(index: index, wrapper: wrapper, wear: initialWear)
                         pendingEditorIndex = index
+                    },
+                    onInventoryItemSelected: { item in
+                        viewModel.updateSlotWithItem(index: index, item: item)
+                        activeSheetItem = nil
                     }
                 )
                 .presentationDetents([.medium, .large])
@@ -667,133 +857,87 @@ struct ContentView: View {
 
 struct CustomTradeUpView: View {
     var viewModel: TradeUpViewModel
+    @ObservedObject var inventoryManager: InventoryManager
+    
     @Binding var activeSheetItem: activeSheet?
     @Binding var pendingEditorIndex: Int?
+    @Binding var selectedTab: Int
     
     @State private var showSaveAlert = false
-    @State private var showExitAlert = false // 新增：退出确认弹窗
+    @State private var showExitAlert = false
     @State private var saveTitle = ""
     
     var body: some View {
         NavigationStack {
             VStack(spacing: 0) {
-                // MARK: - 自定义顶部栏 (Custom Header)
-                // 彻底替代系统导航栏，解决折叠问题
-                HStack(alignment: .top) { // 改为顶对齐，适应多行
+                // 自定义顶部栏
+                HStack(alignment: .top) {
                     VStack(alignment: .leading, spacing: 4) {
-                        // 动态大标题：有配方名显示配方名，没有则显示“新建配方”
                         let displayTitle = (viewModel.currentEditingRecipeId != nil && !viewModel.currentEditingRecipeTitle.isEmpty)
                             ? viewModel.currentEditingRecipeTitle
                             : "新建配方"
                             
                         Text(displayTitle)
-                            .font(.largeTitle) // 大字号
+                            .font(.largeTitle)
                             .fontWeight(.bold)
-                            .lineLimit(1) // 防止标题过长换行
-                            .minimumScaleFactor(0.8) // 允许适当缩小
+                            .lineLimit(1)
+                            .minimumScaleFactor(0.8)
                         
-                        // 动态状态栏：显示“新建模式”或“退出编辑”按钮
                         if viewModel.currentEditingRecipeId != nil {
-                            // 编辑模式：显示红色退出按钮
                             Button(action: {
-                                if viewModel.hasUnsavedChanges {
-                                    showExitAlert = true
-                                } else {
-                                    withAnimation(.spring(response: 0.3, dampingFraction: 0.6)) {
-                                        viewModel.exitEditMode()
-                                    }
-                                }
+                                if viewModel.hasUnsavedChanges { showExitAlert = true }
+                                else { withAnimation(.spring(response: 0.3, dampingFraction: 0.6)) { viewModel.exitEditMode() } }
                             }) {
                                 HStack(spacing: 4) {
                                     Image(systemName: "arrow.uturn.backward.circle.fill")
                                     Text("退出编辑模式")
                                 }
-                                .font(.caption)
-                                .fontWeight(.bold)
-                                .foregroundColor(.white)
-                                .padding(.horizontal, 10)
-                                .padding(.vertical, 5)
-                                .background(
-                                    Capsule()
-                                        .fill(Color.red.opacity(0.9))
-                                        .shadow(color: .red.opacity(0.3), radius: 4, x: 0, y: 2)
-                                )
+                                .font(.caption).fontWeight(.bold).foregroundColor(.white)
+                                .padding(.horizontal, 10).padding(.vertical, 5)
+                                .background(Capsule().fill(Color.red.opacity(0.9)).shadow(color: .red.opacity(0.3), radius: 4, x: 0, y: 2))
                             }
                             .transition(.asymmetric(insertion: .scale.combined(with: .opacity), removal: .scale.combined(with: .opacity)))
                         } else {
-                            // 新建模式：显示安静的提示
                             HStack(spacing: 4) {
                                 Image(systemName: "sparkles")
                                 Text("当前为新建模式")
                             }
-                            .font(.caption)
-                            .fontWeight(.medium)
-                            .foregroundColor(.secondary)
-                            .padding(.horizontal, 8)
-                            .padding(.vertical, 4)
-                            .background(
-                                Capsule()
-                                    .fill(Color(UIColor.secondarySystemBackground))
-                            )
+                            .font(.caption).fontWeight(.medium).foregroundColor(.secondary)
+                            .padding(.horizontal, 8).padding(.vertical, 4)
+                            .background(Capsule().fill(Color(UIColor.secondarySystemBackground)))
                             .transition(.opacity)
                         }
                     }
-                    .animation(.default, value: viewModel.currentEditingRecipeId) // 为整个标题区域添加动画
-                    
+                    .animation(.default, value: viewModel.currentEditingRecipeId)
                     Spacer()
-                    
-                    // 右侧按钮组
                     if viewModel.filledCount > 0 {
                         HStack(spacing: 0) {
-                            Button(action: {
-                                // 如果正在编辑旧配方，使用它的标题作为默认值
-                                saveTitle = viewModel.currentEditingRecipeTitle
-                                showSaveAlert = true
-                            }) {
-                                Text("保存")
-                                    .foregroundColor(.green)
-                                    .fontWeight(.medium)
+                            Button(action: { saveTitle = viewModel.currentEditingRecipeTitle; showSaveAlert = true }) {
+                                Text("保存").foregroundColor(.green).fontWeight(.medium)
                             }
-                            
-                            Rectangle()
-                                .fill(Color.gray.opacity(0.3))
-                                .frame(width: 1, height: 14)
-                                .padding(.horizontal, 12)
-                            
-                            Button(action: {
-                                withAnimation { viewModel.isEditing.toggle() }
-                            }) {
-                                Text(viewModel.isEditing ? "完成" : "编辑")
-                                    .fontWeight(viewModel.isEditing ? .bold : .regular)
-                                    .foregroundColor(.blue)
+                            Rectangle().fill(Color.gray.opacity(0.3)).frame(width: 1, height: 14).padding(.horizontal, 12)
+                            Button(action: { withAnimation { viewModel.isEditing.toggle() } }) {
+                                Text(viewModel.isEditing ? "完成" : "编辑").fontWeight(viewModel.isEditing ? .bold : .regular).foregroundColor(.blue)
                             }
-                        }
-                        .font(.system(size: 17)) // 统一按钮字号
-                        .padding(.top, 8) // 微调对齐
+                        }.font(.system(size: 17)).padding(.top, 8)
                     }
                 }
-                .padding(.horizontal, 16)
-                .padding(.top, 10) // 顶部留白
-                .padding(.bottom, 5)
-                .background(Color(UIColor.systemBackground)) // 确保背景不透明
+                .padding(.horizontal, 16).padding(.top, 10).padding(.bottom, 5).background(Color(UIColor.systemBackground))
                 
                 // 顶部数据栏
                 ScrollView(.horizontal, showsIndicators: false) {
                     HStack(spacing: 12) {
                         StatCard(title: "素材数量", value: viewModel.countString)
                         StatCard(title: "总成本", value: viewModel.totalCostString)
-                        
                         let displayEV = viewModel.expectedValue > 0 ? String(format: "¥%.2f", viewModel.expectedValue) : "---"
                         StatCard(title: "期望产出", value: displayEV, color: .blue)
-                        
                         let roiVal = viewModel.roi * 100
                         let roiColor: Color = roiVal > 0 ? .red : (roiVal < 0 ? .green : .primary)
                         let prefix = roiVal > 0 ? "+" : ""
                         let displayROI = viewModel.expectedValue > 0 ? "\(prefix)\(String(format: "%.1f", roiVal))%" : "---"
                         StatCard(title: "ROI", value: displayROI, color: roiColor)
                     }
-                    .padding(.horizontal, 12)
-                    .padding(.vertical, 10)
+                    .padding(.horizontal, 12).padding(.vertical, 10)
                 }
                 .background(Color(UIColor.systemBackground))
                 .onTapGesture { withAnimation { viewModel.isEditing = false } }
@@ -801,60 +945,32 @@ struct CustomTradeUpView: View {
                 ScrollViewReader { scrollProxy in
                     ScrollView {
                         VStack(alignment: .leading, spacing: 20) {
-                            
                             ForEach(viewModel.groupedSlots.filter { !$0.isResult }) { group in
                                 VStack(alignment: .leading, spacing: 8) {
-                                    Text(group.name)
-                                        .font(.system(size: 12, weight: .bold))
-                                        .foregroundColor(.secondary)
-                                        .padding(.horizontal, 16)
-                                    
+                                    Text(group.name).font(.system(size: 12, weight: .bold)).foregroundColor(.secondary).padding(.horizontal, 16)
                                     LazyVGrid(columns: [GridItem(.adaptive(minimum: 100), spacing: 10)], spacing: 10) {
                                         ForEach(group.items) { item in
                                             SlotView(
-                                                item: item,
-                                                isEditing: viewModel.isEditing,
-                                                isFull: viewModel.isFull,
-                                                onDelete: {
-                                                    if let index = viewModel.slots.firstIndex(where: { $0?.id == item.id }) {
-                                                        viewModel.deleteSlot(at: index)
-                                                    }
-                                                },
-                                                onDuplicate: {
-                                                    if let index = viewModel.slots.firstIndex(where: { $0?.id == item.id }) {
-                                                        viewModel.duplicateSlot(at: index)
-                                                    }
-                                                }
+                                                item: item, isEditing: viewModel.isEditing, isFull: viewModel.isFull, isOutcome: false,
+                                                onDelete: { if let index = viewModel.slots.firstIndex(where: { $0?.id == item.id }) { viewModel.deleteSlot(at: index) } },
+                                                onDuplicate: { if let index = viewModel.slots.firstIndex(where: { $0?.id == item.id }) { viewModel.duplicateSlot(at: index) } }
                                             )
                                             .onTapGesture {
-                                                if viewModel.isEditing {
-                                                    withAnimation { viewModel.isEditing = false }
-                                                } else {
-                                                    if let index = viewModel.slots.firstIndex(where: { $0?.id == item.id }) {
-                                                        handleSlotTap(index: index)
-                                                    }
-                                                }
+                                                if viewModel.isEditing { withAnimation { viewModel.isEditing = false } }
+                                                else { if let index = viewModel.slots.firstIndex(where: { $0?.id == item.id }) { handleSlotTap(index: index) } }
                                             }
-                                            .onLongPressGesture {
-                                                let gen = UIImpactFeedbackGenerator(style: .heavy)
-                                                gen.impactOccurred()
-                                                withAnimation { viewModel.isEditing = true }
-                                            }
+                                            .onLongPressGesture { let gen = UIImpactFeedbackGenerator(style: .heavy); gen.impactOccurred(); withAnimation { viewModel.isEditing = true } }
                                         }
-                                    }
-                                    .padding(.horizontal, 12)
+                                    }.padding(.horizontal, 12)
                                 }
                             }
-                            
                             if !viewModel.isFull {
                                 LazyVGrid(columns: [GridItem(.adaptive(minimum: 100), spacing: 10)], spacing: 10) {
                                     let firstEmptyIndex = viewModel.slots.firstIndex(where: { $0 == nil }) ?? viewModel.filledCount
-                                    SlotView(item: nil, isEditing: false, isFull: false, onDelete: {}, onDuplicate: {})
+                                    SlotView(item: nil, isEditing: false, isFull: false, isOutcome: false, onDelete: {}, onDuplicate: {})
                                         .onTapGesture { handleSlotTap(index: firstEmptyIndex) }
-                                }
-                                .padding(.horizontal, 12)
+                                }.padding(.horizontal, 12)
                             }
-                            
                             if viewModel.hasCalculated && !viewModel.simulationResults.isEmpty {
                                 Divider().padding(.vertical, 10).id("ResultsAnchor")
                                 Text("模拟产出").font(.title3).bold().padding(.leading, 16)
@@ -864,133 +980,73 @@ struct CustomTradeUpView: View {
                                         LazyVGrid(columns: [GridItem(.adaptive(minimum: 100), spacing: 10)], spacing: 10) {
                                             ForEach(group.items) { item in
                                                 let prob = DataManager.shared.tempProbabilities[item.id] ?? 0
-                                                SlotView(
-                                                    item: item,
-                                                    isEditing: false,
-                                                    isFull: true,
-                                                    probability: prob,
-                                                    onDelete: {},
-                                                    onDuplicate: {}
-                                                )
-                                                .disabled(true)
+                                                SlotView(item: item, isEditing: false, isFull: true, probability: prob, isOutcome: true, onDelete: {}, onDuplicate: {}).disabled(true)
                                             }
                                         }.padding(.horizontal, 12)
                                     }
                                 }
                             }
                             Spacer(minLength: 100)
-                        }
-                        .padding(.top, 12)
+                        }.padding(.top, 12)
                     }
                     .onTapGesture { withAnimation { viewModel.isEditing = false } }
-                    
                     if viewModel.filledCount == 10 {
                         VStack {
-                            Button(action: {
-                                withAnimation {
-                                    viewModel.simulate()
-                                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
-                                        withAnimation { scrollProxy.scrollTo("ResultsAnchor", anchor: .top) }
-                                    }
-                                }
-                            }) {
-                                Text(viewModel.hasCalculated ? "重新计算" : "开始模拟汰换")
-                                    .font(.headline).foregroundColor(.white)
-                                    .frame(maxWidth: .infinity).frame(height: 50)
-                                    .background(Color.blue).cornerRadius(12)
+                            Button(action: { withAnimation { viewModel.simulate(); DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { withAnimation { scrollProxy.scrollTo("ResultsAnchor", anchor: .top) } } } }) {
+                                Text(viewModel.hasCalculated ? "重新计算" : "开始模拟汰换").font(.headline).foregroundColor(.white)
+                                    .frame(maxWidth: .infinity).frame(height: 50).background(Color.blue).cornerRadius(12)
                             }
-                        }
-                        .padding()
-                        .background(Color(UIColor.secondarySystemBackground))
-                        .transition(.move(edge: .bottom).combined(with: .opacity))
-                        .zIndex(1)
+                        }.padding().background(Color(UIColor.secondarySystemBackground))
+                        .transition(.move(edge: .bottom).combined(with: .opacity)).zIndex(1)
                     }
                 }
             }
-            // 🟢 核心修复：完全隐藏系统导航栏，改用上方的手写 HStack
             .toolbar(.hidden, for: .navigationBar)
-            // 保存弹窗
             .alert("保存配方", isPresented: $showSaveAlert) {
-                TextField("请输入配方名称", text: $saveTitle)
-                Button("取消", role: .cancel) { }
-                Button("保存") {
-                    saveRecipe()
-                }
-            } message: {
-                if viewModel.currentEditingRecipeId != nil {
-                    Text("当前正在编辑现有配方：\n“\(viewModel.currentEditingRecipeTitle)”\n保存将覆盖原记录。")
-                } else {
-                    Text("新配方将保存到“我的配方”模块中")
-                }
-            }
-            // 退出确认弹窗
+                TextField("请输入配方名称", text: $saveTitle); Button("取消", role: .cancel) { }; Button("保存") { saveRecipe() }
+            } message: { if viewModel.currentEditingRecipeId != nil { Text("当前正在编辑现有配方：\n“\(viewModel.currentEditingRecipeTitle)”\n保存将覆盖原记录。") } else { Text("新配方将保存到“我的配方”模块中") } }
             .alert("未保存的更改", isPresented: $showExitAlert) {
-                Button("取消", role: .cancel) { }
-                Button("直接退出", role: .destructive) {
-                    withAnimation(.spring(response: 0.3, dampingFraction: 0.6)) {
-                        viewModel.exitEditMode()
-                    }
-                }
-            } message: {
-                Text("您对“\(viewModel.currentEditingRecipeTitle)”进行了更改但尚未保存。\n直接退出将丢失这些更改。")
-            }
+                Button("取消", role: .cancel) { }; Button("直接退出", role: .destructive) { withAnimation(.spring(response: 0.3, dampingFraction: 0.6)) { viewModel.exitEditMode() } }
+            } message: { Text("您对“\(viewModel.currentEditingRecipeTitle)”进行了更改但尚未保存。\n直接退出将丢失这些更改。") }
         }
     }
     
     func handleSlotTap(index: Int) {
-        if viewModel.slots[index] == nil {
-            activeSheetItem = .selector(slotIndex: index)
-        } else {
-            activeSheetItem = .editor(slotIndex: index)
-        }
+        if viewModel.slots[index] == nil { activeSheetItem = .selector(slotIndex: index) } else { activeSheetItem = .editor(slotIndex: index) }
     }
     
-    // MARK: - 保存逻辑核心修改
     func saveRecipe() {
-        let items = viewModel.slots.compactMap { $0 }
-        if items.isEmpty { return }
-        
+        let items = viewModel.slots.compactMap { $0 }; if items.isEmpty { return }
         var bestOutcomeData: (Skin, Double, String)? = nil
-        
         if viewModel.hasCalculated, let best = viewModel.simulationResults.flatMap({ $0.items }).first {
             let prob = DataManager.shared.tempProbabilities[best.id] ?? 0.0
-            var wearName = "未知磨损"
-            for wear in Wear.allCases {
-                if wear.range.contains(best.wearValue) { wearName = wear.rawValue; break }
-            }
+            var wearName = "未知磨损"; for wear in Wear.allCases { if wear.range.contains(best.wearValue) { wearName = wear.rawValue; break } }
             bestOutcomeData = (best.skin, prob, wearName)
         }
-        
-        // 关键逻辑：如果有当前 ID，则使用该 ID 更新；否则生成新 ID
         let recipeId = viewModel.currentEditingRecipeId ?? UUID()
-        
-        let newRecipe = SavedRecipe(
-            id: recipeId, // 使用现有 ID 或新 ID
-            title: saveTitle.isEmpty ? "未命名配方" : saveTitle,
-            items: items,
-            ev: viewModel.expectedValue,
-            roi: viewModel.roi,
-            bestOutcome: bestOutcomeData
-        )
-        
+        let newRecipe = SavedRecipe(id: recipeId, title: saveTitle.isEmpty ? "未命名配方" : saveTitle, items: items, ev: viewModel.expectedValue, roi: viewModel.roi, bestOutcome: bestOutcomeData)
         RecipeManager.shared.saveRecipe(newRecipe)
-        
-        // 保存后更新当前编辑状态，防止重复新建
-        viewModel.currentEditingRecipeId = newRecipe.id
-        viewModel.currentEditingRecipeTitle = newRecipe.title
-        
-        // 关键：保存成功后，更新快照状态，意味着“更改已保存”
-        viewModel.snapshotState()
+        viewModel.currentEditingRecipeId = newRecipe.id; viewModel.currentEditingRecipeTitle = newRecipe.title; viewModel.snapshotState()
     }
 }
 
-// MARK: - 皮肤选择器
+// MARK: - 皮肤选择器 (改进版：支持我的库存)
 struct SkinSelectorView: View {
     var viewModel: TradeUpViewModel
+    @ObservedObject var inventoryManager: InventoryManager
     var slotIndex: Int
+    @Binding var selectedTab: Int
+    
     var onSkinSelected: (SelectableSkinWrapper, Double) -> Void
+    var onInventoryItemSelected: (TradeItem) -> Void
     
     @Environment(\.dismiss) var dismiss
+    
+    enum SelectionSource: String, CaseIterable {
+        case database = "数据库搜索"
+        case inventory = "我的库存"
+    }
+    @State private var selectionSource: SelectionSource = .database
     @State private var searchText = ""
     @State private var statTrakFilter: Int = 0
     @State private var wearFilter: Wear? = nil
@@ -1003,93 +1059,189 @@ struct SkinSelectorView: View {
         return baseList.filter { $0.skin.name.localizedCaseInsensitiveContains(searchText) }
     }
     
+    // 🔥 修复：根据配方约束 (品质/暗金) 过滤库存
+    var filteredInventory: [TradeItem] {
+        // 获取当前配方的约束：品质等级 (reqLevel) 和 暗金状态 (reqST)
+        // 如果当前槽位是空的，这些值为 nil，表示不限制
+        let (reqLevel, reqST) = viewModel.currentConstraints
+        
+        return inventoryManager.inventory.filter { item in
+            // 1. 基础合法性 (过滤掉隐秘级、匕首、手套等不可炼金物品)
+            if !viewModel.isValidInput(item.skin) { return false }
+            
+            // 2. 品质约束 (必须与当前配方品质一致)
+            if let targetLv = reqLevel, let itemLv = item.skin.rarity?.level {
+                if itemLv != targetLv { return false }
+            }
+            
+            // 3. 暗金约束 (必须与当前配方暗金状态一致)
+            if let targetST = reqST {
+                if item.isStatTrak != targetST { return false }
+            }
+            
+            // 4. 搜索文本过滤
+            if !searchText.isEmpty {
+                let nameMatch = item.skin.name.localizedCaseInsensitiveContains(searchText) ||
+                                item.skin.baseName.localizedCaseInsensitiveContains(searchText)
+                if !nameMatch { return false }
+            }
+            
+            return true
+        }
+    }
+    
+    let inventoryGridColumns = [ GridItem(.adaptive(minimum: 110), spacing: 10) ]
+    
     var body: some View {
         NavigationStack {
             VStack(spacing: 0) {
-                Picker("类型", selection: $statTrakFilter) {
-                    Text("全部").tag(0)
-                    Text("StatTrak™").tag(1)
-                    Text("普通").tag(2)
+                Picker("来源", selection: $selectionSource) {
+                    ForEach(SelectionSource.allCases, id: \.self) { source in Text(source.rawValue).tag(source) }
                 }
-                .pickerStyle(.segmented)
-                .padding(.horizontal)
-                .padding(.top, 10)
+                .pickerStyle(.segmented).padding(.horizontal).padding(.vertical, 10)
+                .onChange(of: selectionSource) { newValue in
+                    searchText = ""
+                    if newValue == .inventory { inventoryManager.fetchMissingWears() }
+                }
                 
-                ScrollView(.horizontal, showsIndicators: false) {
-                    HStack(spacing: 8) {
-                        FilterChip(title: "全部外观", isSelected: wearFilter == nil) { wearFilter = nil }
-                        ForEach(Wear.allCases) { wear in
-                            FilterChip(title: wear.rawValue, isSelected: wearFilter == wear) { wearFilter = wear }
+                if selectionSource == .database {
+                    VStack(spacing: 0) {
+                        Picker("类型", selection: $statTrakFilter) { Text("全部").tag(0); Text("StatTrak™").tag(1); Text("普通").tag(2) }.pickerStyle(.segmented).padding(.horizontal).padding(.bottom, 10)
+                        ScrollView(.horizontal, showsIndicators: false) {
+                            HStack(spacing: 8) {
+                                FilterChip(title: "全部外观", isSelected: wearFilter == nil) { wearFilter = nil }
+                                ForEach(Wear.allCases) { wear in FilterChip(title: wear.rawValue, isSelected: wearFilter == wear) { wearFilter = wear } }
+                            }.padding(.horizontal).padding(.bottom, 10)
                         }
-                    }
-                    .padding(.horizontal)
-                    .padding(.vertical, 10)
-                }
-                
-                Divider()
-                
-                List(filteredWrappers) { wrapper in
-                    HStack {
-                        CachedImage(url: wrapper.skin.imageURL, transition: false)
-                            .frame(width: 50, height: 38)
-                        
-                        VStack(alignment: .leading, spacing: 4) {
-                            Text(wrapper.displayName)
-                                .font(.body)
-                                .fontWeight(wrapper.isStatTrak ? .semibold : .regular)
-                                .foregroundColor(wrapper.isStatTrak ? .orange : .primary)
-                            
+                        Divider()
+                        List(filteredWrappers) { wrapper in
                             HStack {
-                                Text(wrapper.skin.rarity?.name ?? "")
-                                    .font(.caption)
-                                    .foregroundColor(wrapper.skin.rarity?.swiftColor ?? .gray)
-                                
-                                Text(wrapper.getPreviewPrice(for: wearFilter))
-                                    .font(.caption)
-                                    .fontWeight(.bold)
-                                    .foregroundColor(.green)
+                                CachedImage(url: wrapper.skin.imageURL, transition: false).frame(width: 50, height: 38)
+                                VStack(alignment: .leading, spacing: 4) {
+                                    Text(wrapper.getDisplayName(for: wearFilter)).font(.body).fontWeight(wrapper.isStatTrak ? .semibold : .regular).foregroundColor(wrapper.isStatTrak ? .orange : .primary)
+                                    HStack {
+                                        Text(wrapper.skin.rarity?.name ?? "").font(.caption).foregroundColor(wrapper.skin.rarity?.swiftColor ?? .gray)
+                                        Text(wrapper.getPreviewPrice(for: wearFilter)).font(.caption).fontWeight(.bold).foregroundColor(.green)
+                                    }
+                                }
+                                Spacer()
+                            }
+                            .contentShape(Rectangle())
+                            .onTapGesture {
+                                var initialWear = wrapper.skin.min_float ?? 0
+                                if let w = wearFilter { let mid = (w.range.lowerBound + w.range.upperBound) / 2; initialWear = max(initialWear, mid) } else { initialWear = max(initialWear, 0.035) }
+                                onSkinSelected(wrapper, initialWear); dismiss()
                             }
                         }
-                        Spacer()
                     }
-                    .contentShape(Rectangle())
-                    .onTapGesture {
-                        var initialWear = wrapper.skin.min_float ?? 0
-                        if let w = wearFilter {
-                            let mid = (w.range.lowerBound + w.range.upperBound) / 2
-                            initialWear = max(initialWear, mid)
+                } else {
+                    ZStack {
+                        Color(UIColor.systemGroupedBackground)
+                        
+                        // 显示结果
+                        if filteredInventory.isEmpty && !searchText.isEmpty {
+                            // 有搜索内容但无结果
+                            VStack(spacing: 20) {
+                                Image(systemName: "magnifyingglass").font(.system(size: 50)).foregroundColor(.gray)
+                                Text("未找到匹配的库存物品").foregroundColor(.secondary)
+                            }
+                        } else if inventoryManager.inventory.isEmpty && !inventoryManager.isLoading {
+                            // 库存完全为空
+                            VStack(spacing: 20) {
+                                Image(systemName: "archivebox").font(.system(size: 50)).foregroundColor(.gray)
+                                Text("库存空空如也").foregroundColor(.secondary)
+                                Button(action: { dismiss(); DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { selectedTab = 1 } }) {
+                                    Text("前往库存页面加载").fontWeight(.bold).padding().frame(width: 200).background(Color.blue).foregroundColor(.white).cornerRadius(10)
+                                }
+                            }
+                        } else if filteredInventory.isEmpty && !inventoryManager.inventory.isEmpty {
+                            // 有库存，但被品质/暗金条件过滤光了
+                            VStack(spacing: 20) {
+                                Image(systemName: "slider.horizontal.3").font(.system(size: 50)).foregroundColor(.gray)
+                                Text("没有符合当前配方要求的物品").font(.headline).foregroundColor(.secondary)
+                                Text("当前配方限制：\n品质：\(getLevelName(viewModel.currentConstraints.0))\n暗金：\(getSTName(viewModel.currentConstraints.1))").font(.caption).foregroundColor(.gray).multilineTextAlignment(.center)
+                            }
                         } else {
-                            initialWear = max(initialWear, 0.035)
+                            ScrollView {
+                                LazyVGrid(columns: inventoryGridColumns, spacing: 12) {
+                                    ForEach(filteredInventory) { item in
+                                        SlotView(item: item, isEditing: false, isFull: true, isOutcome: false, onDelete: {}, onDuplicate: {})
+                                            .frame(height: 130)
+                                            .onTapGesture { onInventoryItemSelected(item); dismiss() }
+                                    }
+                                }.padding()
+                            }
                         }
-                        onSkinSelected(wrapper, initialWear)
-                        dismiss()
+                        
+                        if inventoryManager.showFetchModal {
+                            ZStack {
+                                Color.black.opacity(0.4).ignoresSafeArea()
+                                VStack(spacing: 20) {
+                                    ProgressView().scaleEffect(1.5).tint(.white)
+                                    Text(inventoryManager.fetchProgress).foregroundColor(.white).font(.headline)
+                                    Button("后台运行") { inventoryManager.runInBackground() }
+                                    .font(.caption).foregroundColor(.gray).padding(.top, 10)
+                                }
+                                .padding(30).background(Color(UIColor.secondarySystemBackground).opacity(0.95)).cornerRadius(16).shadow(radius: 20)
+                            }
+                            .zIndex(200)
+                        } else if inventoryManager.isLoading {
+                            ZStack {
+                                Color.black.opacity(0.4)
+                                VStack(spacing: 16) {
+                                    ProgressView().scaleEffect(1.5).tint(.white)
+                                    Text("正在加载库存...").foregroundColor(.white).font(.headline)
+                                }.padding(30).background(Color(UIColor.secondarySystemBackground).opacity(0.9)).cornerRadius(16)
+                            }
+                        }
                     }
                 }
-                .searchable(text: $searchText, prompt: "搜索皮肤")
             }
-            .navigationTitle("选择皮肤")
+            .searchable(text: $searchText, prompt: selectionSource == .database ? "搜索皮肤数据库" : "搜索我的库存")
+            .navigationTitle("选择 #\(slotIndex + 1) 素材")
+            .navigationBarTitleDisplayMode(.inline)
+            // 🔥 新增：仅在库存模式下显示刷新按钮
             .toolbar {
+                if selectionSource == .inventory {
+                    ToolbarItem(placement: .primaryAction) {
+                        Button(action: {
+                            // 强制刷新磨损，无视是否已缓存
+                            inventoryManager.fetchMissingWears(forceRestart: true)
+                        }) {
+                            Image(systemName: "arrow.clockwise")
+                        }
+                        .disabled(inventoryManager.isFetching)
+                    }
+                }
                 ToolbarItem(placement: .cancellationAction) { Button("取消") { dismiss() } }
+            }
+            .onAppear {
+                inventoryManager.refreshWearsFromCache()
+                if selectionSource == .inventory && !inventoryManager.inventory.isEmpty {
+                    inventoryManager.fetchMissingWears()
+                }
             }
         }
     }
-}
-
-struct FilterChip: View {
-    let title: String
-    let isSelected: Bool
-    let action: () -> Void
     
-    var body: some View {
-        Text(title)
-            .font(.system(size: 13, weight: .medium))
-            .padding(.horizontal, 16)
-            .padding(.vertical, 8)
-            .background(isSelected ? Color.blue : Color(UIColor.secondarySystemBackground))
-            .foregroundColor(isSelected ? .white : .primary)
-            .cornerRadius(20)
-            .onTapGesture(perform: action)
-            .animation(.easeInOut(duration: 0.2), value: isSelected)
+    // 辅助函数：获取品质名称
+    func getLevelName(_ level: Int?) -> String {
+        guard let level = level else { return "不限" }
+        switch level {
+        case 0: return "消费级"
+        case 1: return "工业级"
+        case 2: return "军规级"
+        case 3: return "受限"
+        case 4: return "保密"
+        case 5: return "隐秘"
+        default: return "未知"
+        }
+    }
+    
+    // 辅助函数：获取暗金状态名称
+    func getSTName(_ isST: Bool?) -> String {
+        guard let isST = isST else { return "不限" }
+        return isST ? "StatTrak™" : "普通"
     }
 }
 
@@ -1099,17 +1251,21 @@ struct SlotView: View {
     let isEditing: Bool
     let isFull: Bool
     var probability: Double? = nil
+    var isOutcome: Bool = false
     var onDelete: () -> Void
     var onDuplicate: () -> Void
-    
     @State private var shakeTrigger = false
-    
     var displayName: String { item?.displayName ?? "" }
-    var wearName: String {
+    
+    // 获取纯净的磨损名称 (例如 "略有磨损")
+    var simpleWearName: String {
         guard let item = item else { return "" }
-        for wear in Wear.allCases { if wear.range.contains(item.wearValue) { return "(\(wear.rawValue))" } }
-        return ""
+        for wear in Wear.allCases {
+            if wear.range.contains(item.wearValue) { return wear.rawValue }
+        }
+        return "未知"
     }
+    
     var wearColor: Color {
         guard let item = item else { return .gray }
         if item.wearValue < 0.07 { return Color(hex: "#2ebf58")! }
@@ -1117,12 +1273,6 @@ struct SlotView: View {
         if item.wearValue < 0.38 { return Color(hex: "#eabd38")! }
         if item.wearValue < 0.45 { return Color(hex: "#eb922a")! }
         return Color(hex: "#e24e4d")!
-    }
-    
-    var displayPrice: String {
-        guard let item = item else { return "" }
-        let p = item.price
-        return p > 0 ? String(format: "¥%.2f", p) : "---"
     }
     
     var body: some View {
@@ -1139,28 +1289,29 @@ struct SlotView: View {
                 
                 if let item = item {
                     VStack(spacing: 0) {
+                        // 图片
                         CachedImage(url: item.skin.imageURL, transition: false)
                             .frame(height: 40)
                             .padding(.top, 6)
                         
-                        VStack(spacing: 1) {
+                        // 文字信息区域
+                        VStack(spacing: 2) {
+                            // 1. 枪名
                             Text(displayName)
                                 .font(.system(size: 10, weight: .medium))
                                 .lineLimit(1)
                                 .padding(.horizontal, 2)
                             
-                            Text(displayPrice)
-                                .font(.system(size: 12, weight: .heavy))
-                                .foregroundColor(item.price > 0 ? .green : .orange)
-                            
-                            Text(wearName)
-                                .font(.system(size: 8, weight: .bold))
+                            // 2. 修改：枪名下方直接显示外观 (颜色对应)
+                            Text(simpleWearName)
+                                .font(.system(size: 9, weight: .bold))
                                 .foregroundColor(wearColor)
                         }
                         .padding(.top, 2)
                         
                         Spacer(minLength: 0)
                         
+                        // 底部磨损条和数值
                         VStack(spacing: 3) {
                             WearBarView(currentFloat: item.wearValue, minFloat: item.skin.min_float ?? 0, maxFloat: item.skin.max_float ?? 1)
                                 .frame(height: 4)
@@ -1173,6 +1324,7 @@ struct SlotView: View {
                         .padding(.bottom, 8)
                     }
                     
+                    // 概率显示 (如果是产物)
                     if let prob = probability {
                         Text(String(format: "%.1f%%", prob * 100))
                             .font(.system(size: 9, weight: .bold))
@@ -1199,9 +1351,7 @@ struct SlotView: View {
             )
             .onAppear {
                 if isEditing {
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
-                        shakeTrigger = true
-                    }
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { shakeTrigger = true }
                 }
             }
             .onChange(of: isEditing) { newValue in shakeTrigger = newValue }
@@ -1235,7 +1385,23 @@ struct SlotView: View {
     }
 }
 
-// MARK: - 组件补全
+struct FilterChip: View {
+    let title: String
+    let isSelected: Bool
+    let action: () -> Void
+    
+    var body: some View {
+        Text(title)
+            .font(.system(size: 13, weight: .medium))
+            .padding(.horizontal, 16)
+            .padding(.vertical, 8)
+            .background(isSelected ? Color.blue : Color(UIColor.secondarySystemBackground))
+            .foregroundColor(isSelected ? .white : .primary)
+            .cornerRadius(20)
+            .onTapGesture(perform: action)
+            .animation(.easeInOut(duration: 0.2), value: isSelected)
+    }
+}
 
 struct StatCard: View {
     let title: String
@@ -1302,8 +1468,6 @@ struct WearEditorView: View {
     var cleanName: String { return skin.baseName }
     
     var dynamicPrice: String {
-        // 使用 FuzzyPriceHelper 获取动态价格，默认为非 StatTrak（因为编辑器没传状态）
-        // 如果需要精确显示 StatTrak 价格，WearEditorView 需要接受 isStatTrak 参数
         let price = FuzzyPriceHelper.getPrice(skin: skin, wear: sliderValue, isStatTrak: false)
         return price > 0 ? String(format: "¥%.2f", price) : "---"
     }

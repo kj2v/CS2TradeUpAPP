@@ -7,6 +7,7 @@ public struct SteamAsset: Identifiable, Codable {
     public let iconUrl: String
     public let isStatTrak: Bool
     public var wear: Double? // 真实磨损
+    public let inspectLink: String? // 新增：检视链接
 }
 
 // MARK: - Steam 服务
@@ -124,12 +125,28 @@ public class SteamInventoryService {
                                 // 获取中文显示名
                                 let displayName = desc["market_name"] as? String ?? name
                                 
+                                // 解析检视链接 (Inspect Link)
+                                // Steam API 返回的 descriptions -> actions 数组里包含了检视链接模板
+                                var inspectLink: String? = nil
+                                if let actions = desc["actions"] as? [[String: Any]] {
+                                    // 通常第一个 action 就是 "在游戏中检视..."
+                                    // 格式通常为: "steam://rungame/730/76561202255233023/+csgo_econ_action_preview S%owner_steamid%A%assetid%D..."
+                                    if let linkTemplate = actions.first?["link"] as? String {
+                                        // 替换占位符
+                                        inspectLink = linkTemplate
+                                            .replacingOccurrences(of: "%owner_steamid%", with: steamId)
+                                            .replacingOccurrences(of: "%assetid%", with: assetId)
+                                        print(inspectLink)
+                                    }
+                                }
+                                
                                 currentPageAssets.append(SteamAsset(
                                     id: assetId,
                                     name: displayName, // 使用中文显示名
                                     iconUrl: fullIconUrl,
                                     isStatTrak: isStatTrak,
-                                    wear: nil
+                                    wear: nil,
+                                    inspectLink: inspectLink // 赋值
                                 ))
                             }
                         }
