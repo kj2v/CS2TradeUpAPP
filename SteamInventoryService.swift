@@ -15,7 +15,7 @@ public class SteamInventoryService {
     public static let shared = SteamInventoryService()
     
     // 您的 API Key (备用，主要用于 official API，这里暂不使用)
-    private let apiKey = "AB177A71FD700098EBDB08FB9C6B156A"
+    // private let apiKey = ""
     
     // 公开方法：获取完整库存（自动处理分页）
     public func fetchInventory(steamId: String, completion: @escaping (Result<[SteamAsset], Error>) -> Void) {
