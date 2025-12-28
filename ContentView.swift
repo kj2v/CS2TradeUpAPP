@@ -415,7 +415,7 @@ struct SelectableSkinWrapper: Identifiable {
     
     var displayName: String {
         let n = skin.baseName
-        return isStatTrak ? "StatTrak™ \(n)" : n
+        return isStatTrak ? n.replacingOccurrences(of: " | ", with: "（StatTrak™） | ") : n
     }
     
     func getDisplayName(for wearFilter: Wear?) -> String {
