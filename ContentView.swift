@@ -1254,7 +1254,9 @@ struct SlotView: View {
     var isOutcome: Bool = false
     var onDelete: () -> Void
     var onDuplicate: () -> Void
+    
     @State private var shakeTrigger = false
+    
     var displayName: String { item?.displayName ?? "" }
     
     // 获取纯净的磨损名称 (例如 "略有磨损")
@@ -1278,6 +1280,7 @@ struct SlotView: View {
     var body: some View {
         ZStack {
             ZStack {
+                // 背景和边框
                 RoundedRectangle(cornerRadius: 10)
                     .fill(Color(UIColor.secondarySystemBackground))
                     .frame(height: 125)
@@ -1288,31 +1291,41 @@ struct SlotView: View {
                     )
                 
                 if let item = item {
-                    VStack(spacing: 0) {
-                        // 图片
+                    // --- 🔥 核心布局修改区域开始 ---
+                    // 改为统一间距 4，去除中间的 Spacer，让内容更紧凑
+                    VStack(spacing: 4) {
+                        
+                        // 1. 图片
                         CachedImage(url: item.skin.imageURL, transition: false)
                             .frame(height: 40)
-                            .padding(.top, 6)
+                            .padding(.top, 4) // 减小顶部留白
                         
-                        // 文字信息区域
+                        // 2. 文字信息区域
                         VStack(spacing: 2) {
-                            // 1. 枪名
+                            // 枪名：支持双行显示
                             Text(displayName)
                                 .font(.system(size: 10, weight: .medium))
-                                .lineLimit(1)
-                                .padding(.horizontal, 2)
+                                .multilineTextAlignment(.center) // 多行居中
+                                .lineLimit(2) // 允许最多显示2行
+                                .minimumScaleFactor(0.8) // 允许字体最小缩放到80%
+                                .fixedSize(horizontal: false, vertical: true) // 确保高度能撑开
+                                .padding(.horizontal, 4)
                             
-                            // 2. 修改：枪名下方直接显示外观 (颜色对应)
+                            // 外观名称
                             Text(simpleWearName)
                                 .font(.system(size: 9, weight: .bold))
                                 .foregroundColor(wearColor)
                         }
-                        .padding(.top, 2)
                         
-                        Spacer(minLength: 0)
+                        // 3. 价格 (紧接在外观下方)
+                        Text(String(format: "¥%.2f", item.price))
+                            .font(.system(size: 10, weight: .bold))
+                            .foregroundColor(item.price > 0 ? .green : .orange)
                         
-                        // 底部磨损条和数值
-                        VStack(spacing: 3) {
+                        // ❌ 已删除 Spacer(minLength: 0)，消除大片空白
+                        
+                        // 4. 底部磨损条和数值
+                        VStack(spacing: 2) { // 减小磨损条和数值的间距
                             WearBarView(currentFloat: item.wearValue, minFloat: item.skin.min_float ?? 0, maxFloat: item.skin.max_float ?? 1)
                                 .frame(height: 4)
                                 .padding(.horizontal, 6)
@@ -1321,10 +1334,12 @@ struct SlotView: View {
                                 .font(.system(size: 8, design: .monospaced))
                                 .foregroundColor(.secondary)
                         }
-                        .padding(.bottom, 8)
+                        .padding(.bottom, 4) // 减小底部留白
                     }
+                    .frame(maxHeight: .infinity, alignment: .center) // 整体垂直居中
+                    // --- 🔥 核心布局修改区域结束 ---
                     
-                    // 概率显示 (如果是产物)
+                    // 概率显示 (悬浮显示)
                     if let prob = probability {
                         Text(String(format: "%.1f%%", prob * 100))
                             .font(.system(size: 9, weight: .bold))
@@ -1337,16 +1352,18 @@ struct SlotView: View {
                             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
                     }
                 } else {
+                    // 空插槽状态
                     Image(systemName: "plus")
                         .font(.title3)
                         .foregroundColor(.gray)
                 }
             }
+            // 抖动动画逻辑 (保持不变)
             .rotationEffect(.degrees(shakeTrigger ? 1.5 : 0))
             .animation(
                 shakeTrigger ?
                 Animation.easeInOut(duration: 0.12).repeatForever(autoreverses: true).delay(Double.random(in: 0...0.2)) :
-                .default,
+                    .default,
                 value: shakeTrigger
             )
             .onAppear {
@@ -1356,6 +1373,7 @@ struct SlotView: View {
             }
             .onChange(of: isEditing) { newValue in shakeTrigger = newValue }
             
+            // 编辑模式按钮 (删除/复制) - (保持不变)
             if isEditing && item != nil {
                 Button(action: onDelete) {
                     Image(systemName: "minus.circle.fill")
